@@ -3,26 +3,37 @@ import sys
 import re
 import json
 import base64
+import shutil
 import asyncio
 import random
 from collections import deque
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Union
 
 import aiohttp
+from aiohttp import web
 import discord
 from discord.ext import commands
 from discord import app_commands
 from dotenv import load_dotenv
 import yt_dlp
 
-# ─────────────── Locate Pip-installed FFmpeg ─────────────── #
+# ─────────────── Cross-Platform FFmpeg Detection ─────────────── #
 
-try:
-    import imageio_ffmpeg
-    FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
-    print(f"╭ ⟢ Using pip FFmpeg binary: {FFMPEG_EXE}")
-except Exception:
-    FFMPEG_EXE = "ffmpeg"
+def detect_ffmpeg() -> str:
+    # 1. System PATH (Railway, Linux, Docker, or manual Windows PATH)
+    sys_ffmpeg = shutil.which("ffmpeg")
+    if sys_ffmpeg:
+        return sys_ffmpeg
+    # 2. Pip-installed imageio-ffmpeg binary
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        pass
+    return "ffmpeg"
+
+FFMPEG_EXE = detect_ffmpeg()
+print(f"╭ ⟢ Using FFmpeg binary: {FFMPEG_EXE}")
 
 # ─────────────── Configuration & Constants ─────────────── #
 
@@ -89,7 +100,7 @@ bot = commands.Bot(
     help_command=None
 )
 
-# ─────────────── Audio & YTDL Setup ─────────────── #
+# ─────────────── Cloud/Railway Safe YTDL Setup ─────────────── #
 
 YTDL_OPTIONS = {
     "format": "bestaudio/best",
@@ -101,6 +112,12 @@ YTDL_OPTIONS = {
     "no_warnings": True,
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
+    # Emulate mobile apps to prevent Cloud/Railway Datacenter 429 blocks
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android", "ios", "web"]
+        }
+    }
 }
 
 ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
@@ -153,7 +170,19 @@ def get_player(guild_id: int) -> GuildPlayer:
         guild_players[guild_id] = GuildPlayer(guild_id)
     return guild_players[guild_id]
 
-# ─────────────── Multi-Layer Spotify Resolver (Windows SSL Bypass) ─────────────── #
+# ─────────────── Safe Interaction Helper ─────────────── #
+
+async def safe_respond(ctx: commands.Context, content: str = None, embed: discord.Embed = None, view: discord.ui.View = None, ephemeral: bool = False):
+    """Safely responds without throwing 40060 (Already Acknowledged) errors."""
+    if ctx.interaction:
+        if ctx.interaction.response.is_done():
+            return await ctx.interaction.followup.send(content=content, embed=embed, view=view, ephemeral=ephemeral)
+        else:
+            return await ctx.interaction.response.send_message(content=content, embed=embed, view=view, ephemeral=ephemeral)
+    else:
+        return await ctx.send(content=content, embed=embed, view=view)
+
+# ─────────────── Multi-Layer Spotify Resolver ─────────────── #
 
 async def fetch_spotify_tracks(item_type: str, item_id: str) -> List[Dict[str, str]]:
     tracks = []
@@ -161,10 +190,8 @@ async def fetch_spotify_tracks(item_type: str, item_id: str) -> List[Dict[str, s
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept-Language": "en-US,en;q=0.9",
     }
-    # TCPConnector(ssl=False) prevents Windows SSLCertVerificationError
     connector = aiohttp.TCPConnector(ssl=False)
 
-    # Layer 1: Official API (if credentials in .env)
     if SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET:
         try:
             auth_str = f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}"
@@ -208,7 +235,6 @@ async def fetch_spotify_tracks(item_type: str, item_id: str) -> List[Dict[str, s
         except Exception as e:
             print(f"[Spotify API]: {e}")
 
-    # Layer 2: Keyless Embed Scraper
     embed_url = f"https://open.spotify.com/embed/{item_type}/{item_id}"
     try:
         async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
@@ -216,7 +242,6 @@ async def fetch_spotify_tracks(item_type: str, item_id: str) -> List[Dict[str, s
                 if resp.status == 200:
                     html = await resp.text()
 
-                    # 2A: Spotify initial-state Base64 JSON
                     state_match = re.search(r'<script id="initial-state" type="text/plain">([^<]+)</script>', html)
                     if state_match:
                         try:
@@ -244,7 +269,6 @@ async def fetch_spotify_tracks(item_type: str, item_id: str) -> List[Dict[str, s
                         except Exception:
                             pass
 
-                    # 2B: __NEXT_DATA__
                     if not tracks:
                         next_match = re.search(r'<script id="__NEXT_DATA__" type="application/json">([^<]+)</script>', html)
                         if next_match:
@@ -263,7 +287,6 @@ async def fetch_spotify_tracks(item_type: str, item_id: str) -> List[Dict[str, s
                             except Exception:
                                 pass
 
-                    # 2C: Schema.org JSON-LD
                     if not tracks:
                         for ld_match in re.finditer(r'<script type="application/ld\+json">([^<]+)</script>', html):
                             try:
@@ -494,14 +517,14 @@ async def play_next(guild: discord.Guild):
 @bot.hybrid_command(name="join", aliases=["ijoin", "ij", "j", "connect", "ic"], description="Connect bot to your voice channel.")
 async def join(ctx: commands.Context):
     if not ctx.author.voice:
-        return await ctx.send("╭ ☁️ *join a voice channel first so i can find you.*")
+        return await safe_respond(ctx, "╭ ☁️ *join a voice channel first so i can find you.*")
     vc = ctx.guild.voice_client
     if not vc:
         await ctx.author.voice.channel.connect()
-        await ctx.send(f"╭ ⟢ *joined* `{ctx.author.voice.channel.name}` *peacefully.* 🎧")
+        await safe_respond(ctx, f"╭ ⟢ *joined* `{ctx.author.voice.channel.name}` *peacefully.* 🎧")
     else:
         await vc.move_to(ctx.author.voice.channel)
-        await ctx.send(f"╭ ⟢ *moved to* `{ctx.author.voice.channel.name}`. 🌸")
+        await safe_respond(ctx, f"╭ ⟢ *moved to* `{ctx.author.voice.channel.name}`. 🌸")
 
 @bot.hybrid_command(name="leave", aliases=["ileave", "idc", "dc", "disconnect"], description="Disconnect bot from voice.")
 async def leave(ctx: commands.Context):
@@ -511,9 +534,9 @@ async def leave(ctx: commands.Context):
         player.queue.clear()
         player.current = None
         await vc.disconnect()
-        await ctx.send("╭ ⟢ *unplugged headphones and stepped away... bye for now.* ☁️")
+        await safe_respond(ctx, "╭ ⟢ *unplugged headphones and stepped away... bye for now.* ☁️")
     else:
-        await ctx.send("╭ ☁️ *i'm not sitting in any voice channel.*")
+        await safe_respond(ctx, "╭ ☁️ *i'm not sitting in any voice channel.*")
 
 @bot.hybrid_command(name="play", aliases=["p"], description="Play music via title, playlist, spotify or direct link.")
 @app_commands.describe(query="Song title, YouTube link/playlist, or Spotify link")
@@ -521,7 +544,7 @@ async def play(ctx: commands.Context, *, query: str):
     await ctx.defer()
 
     if not ctx.author.voice:
-        return await ctx.send("╭ ☁️ *you must be nestled inside a voice channel first.*")
+        return await safe_respond(ctx, "╭ ☁️ *you must be nestled inside a voice channel first.*")
 
     vc = ctx.guild.voice_client
     if not vc:
@@ -539,7 +562,7 @@ async def play(ctx: commands.Context, *, query: str):
         tracks = await fetch_spotify_tracks(item_type, item_id)
         
         if not tracks:
-            return await ctx.send("╭ ☁️ *couldn't fetch tracks from that Spotify link.*")
+            return await safe_respond(ctx, "╭ ☁️ *couldn't fetch tracks from that Spotify link.*")
 
         for t in tracks:
             s = Song({
@@ -557,24 +580,24 @@ async def play(ctx: commands.Context, *, query: str):
                 description=f"╭── ⟢ added **{len(tracks)}** tracks from Spotify\n╰── 𖦹 ready to serenade your vc.",
                 color=PASTEL_LAVENDER
             )
-            await ctx.send(embed=embed)
+            await safe_respond(ctx, embed=embed)
         else:
             embed = discord.Embed(
                 title="˚₊· queued note ‧₊˚",
                 description=f"╭── ⟢ [{tracks[0]['title']}]({query})\n╰── 🎧 requested by {ctx.author.mention}",
                 color=PASTEL_PINK
             )
-            await ctx.send(embed=embed)
+            await safe_respond(ctx, embed=embed)
 
     else:
         loop = asyncio.get_event_loop()
         try:
             data = await loop.run_in_executor(None, lambda: ytdl.extract_info(query, download=False, process=False))
         except Exception as e:
-            return await ctx.send(f"╭ ☁️ *couldn't fetch that track:* `{e}`")
+            return await safe_respond(ctx, f"╭ ☁️ *couldn't fetch that track:* `{e}`")
 
         if not data:
-            return await ctx.send("╭ ☁️ *no matching results found.*")
+            return await safe_respond(ctx, "╭ ☁️ *no matching results found.*")
 
         if "entries" in data:
             entries = list(data["entries"])
@@ -598,7 +621,7 @@ async def play(ctx: commands.Context, *, query: str):
                 description=f"╭── ⟢ added **{added_count}** tracks from [{data.get('title', 'Playlist')}]({query})\n╰── 𖦹 ready to serenade your vc.",
                 color=PASTEL_LAVENDER
             )
-            await ctx.send(embed=embed)
+            await safe_respond(ctx, embed=embed)
         else:
             info = await loop.run_in_executor(None, lambda: ytdl.extract_info(query, download=False))
             if "entries" in info:
@@ -614,7 +637,7 @@ async def play(ctx: commands.Context, *, query: str):
             )
             if song.thumbnail:
                 embed.set_thumbnail(url=song.thumbnail)
-            await ctx.send(embed=embed)
+            await safe_respond(ctx, embed=embed)
 
     if not vc.is_playing() and not vc.is_paused():
         await play_next(ctx.guild)
@@ -624,33 +647,33 @@ async def pause(ctx: commands.Context):
     vc = ctx.guild.voice_client
     if vc and vc.is_playing():
         vc.pause()
-        await ctx.send("╭ ⟢ *paused track. taking a quiet breath...* 🫧")
+        await safe_respond(ctx, "╭ ⟢ *paused track. taking a quiet breath...* 🫧")
     else:
-        await ctx.send("╭ ☁️ *nothing is actively singing right now.*")
+        await safe_respond(ctx, "╭ ☁️ *nothing is actively singing right now.*")
 
 @bot.hybrid_command(name="resume", description="Resume the paused melody.")
 async def resume(ctx: commands.Context):
     vc = ctx.guild.voice_client
     if vc and vc.is_paused():
         vc.resume()
-        await ctx.send("╭ ⟢ *resumed our sweet melody.* ✨")
+        await safe_respond(ctx, "╭ ⟢ *resumed our sweet melody.* ✨")
     else:
-        await ctx.send("╭ ☁️ *the music isn't currently paused.*")
+        await safe_respond(ctx, "╭ ☁️ *the music isn't currently paused.*")
 
 @bot.hybrid_command(name="skip", aliases=["s"], description="Skip onto the next song.")
 async def skip(ctx: commands.Context):
     vc = ctx.guild.voice_client
     if vc and (vc.is_playing() or vc.is_paused()):
         vc.stop()
-        await ctx.send("╭ ⟢ *skipping along to the next song...* 🍃")
+        await safe_respond(ctx, "╭ ⟢ *skipping along to the next song...* 🍃")
     else:
-        await ctx.send("╭ ☁️ *no songs available to skip.*")
+        await safe_respond(ctx, "╭ ☁️ *no songs available to skip.*")
 
 @bot.hybrid_command(name="previous", aliases=["iprev", "prev", "back", "iback"], description="Return to previous song.")
 async def previous(ctx: commands.Context):
     player = get_player(ctx.guild.id)
     if not player.history:
-        return await ctx.send("╭ ☁️ *memory is clean; no previous track recorded.*")
+        return await safe_respond(ctx, "╭ ☁️ *memory is clean; no previous track recorded.*")
 
     prev_song = player.history.pop()
     if player.current:
@@ -660,7 +683,7 @@ async def previous(ctx: commands.Context):
     vc = ctx.guild.voice_client
     if vc:
         vc.stop()
-    await ctx.send("╭ ⟢ *stepping back into the previous melody...* ⏪")
+    await safe_respond(ctx, "╭ ⟢ *stepping back into the previous melody...* ⏪")
 
 @bot.hybrid_command(name="stop", description="Stop the player and flush the queue.")
 async def stop(ctx: commands.Context):
@@ -669,21 +692,21 @@ async def stop(ctx: commands.Context):
     vc = ctx.guild.voice_client
     if vc:
         vc.stop()
-    await ctx.send("╭ ⟢ *stopped music and washed the queue clean.* 🫧")
+    await safe_respond(ctx, "╭ ⟢ *stopped music and washed the queue clean.* 🫧")
 
 @bot.hybrid_command(name="shuffle", description="Shuffle songs inside the queue randomly.")
 async def shuffle(ctx: commands.Context):
     player = get_player(ctx.guild.id)
     if len(player.queue) < 2:
-        return await ctx.send("╭ ☁️ *need at least two songs in queue to shuffle.*")
+        return await safe_respond(ctx, "╭ ☁️ *need at least two songs in queue to shuffle.*")
     random.shuffle(player.queue)
-    await ctx.send("╭ ⟢ *shuffled queue with a touch of magic.* 🪄")
+    await safe_respond(ctx, "╭ ⟢ *shuffled queue with a touch of magic.* 🪄")
 
 @bot.hybrid_command(name="queue", aliases=["iq", "q"], description="View the current aesthetic song queue.")
 async def queue(ctx: commands.Context):
     player = get_player(ctx.guild.id)
     if not player.current and not player.queue:
-        return await ctx.send("╭ ☁️ *queue is light as air... nothing here yet.*")
+        return await safe_respond(ctx, "╭ ☁️ *queue is light as air... nothing here yet.*")
 
     desc = []
     if player.current:
@@ -702,20 +725,20 @@ async def queue(ctx: commands.Context):
         color=PASTEL_LAVENDER
     )
     embed.set_footer(text=f"Loop: {player.loop_mode.capitalize()} • Bass Boost: {'Active' if player.bass_boost else 'Off'}")
-    await ctx.send(embed=embed)
+    await safe_respond(ctx, embed=embed)
 
 @bot.hybrid_command(name="clear", aliases=["iclr"], description="Totally clear the current queue.")
 async def clear(ctx: commands.Context):
     player = get_player(ctx.guild.id)
     player.queue.clear()
-    await ctx.send("╭ ⟢ *queue wiped clean like freshly fallen snow.* ❄️")
+    await safe_respond(ctx, "╭ ⟢ *queue wiped clean like freshly fallen snow.* ❄️")
 
 @bot.hybrid_command(name="remove", description="Remove a specific song by index or name.")
 @app_commands.describe(target="Song number or matching title")
 async def remove(ctx: commands.Context, *, target: str):
     player = get_player(ctx.guild.id)
     if not player.queue:
-        return await ctx.send("╭ ☁️ *queue is already empty.*")
+        return await safe_respond(ctx, "╭ ☁️ *queue is already empty.*")
 
     removed_song = None
     if target.isdigit():
@@ -731,9 +754,9 @@ async def remove(ctx: commands.Context, *, target: str):
                 break
 
     if removed_song:
-        await ctx.send(f"╭ ⟢ *removed* `[{removed_song.title}]` *from the queue.* 🍃")
+        await safe_respond(ctx, f"╭ ⟢ *removed* `[{removed_song.title}]` *from the queue.* 🍃")
     else:
-        await ctx.send(f"╭ ☁️ *couldn't find any track matching `{target}`.*")
+        await safe_respond(ctx, f"╭ ☁️ *couldn't find any track matching `{target}`.*")
 
 @bot.hybrid_command(name="bass", description="Boost or soften the low-end bass frequencies.")
 @app_commands.describe(enabled="True to boost bass, False to disable")
@@ -741,7 +764,7 @@ async def bass(ctx: commands.Context, enabled: bool):
     player = get_player(ctx.guild.id)
     player.bass_boost = enabled
     state_str = "boosted into warmth ✨" if enabled else "returned to natural acoustic 🍃"
-    await ctx.send(f"╭ ⟢ *bass frequencies are now {state_str}. (Applies to next song)*")
+    await safe_respond(ctx, f"╭ ⟢ *bass frequencies are now {state_str}. (Applies to next song)*")
 
 @bot.hybrid_command(name="loop", aliases=["irepeate", "rep"], description="Set loop mode with interactive buttons.")
 async def loop(ctx: commands.Context):
@@ -752,7 +775,7 @@ async def loop(ctx: commands.Context):
         color=PASTEL_PINK
     )
     view = LoopSelector(player)
-    await ctx.send(embed=embed, view=view)
+    await safe_respond(ctx, embed=embed, view=view)
 
 @bot.hybrid_command(name="help", description="Aesthetic guide to all isai music commands.")
 async def help_cmd(ctx: commands.Context):
@@ -778,7 +801,7 @@ async def help_cmd(ctx: commands.Context):
     )
     embed.add_field(name="₊˚🎧 music controls", value=music_cmds, inline=False)
     embed.set_footer(text="craft with love • prefix: i • isai bot")
-    await ctx.send(embed=embed)
+    await safe_respond(ctx, embed=embed)
 
 # ─────────────── Owner Only Module ─────────────── #
 
@@ -806,12 +829,17 @@ async def dm(ctx: commands.Context, user: discord.User, *, content: str):
         return
     try:
         await user.send(content)
-        await ctx.send(f"╭ ⟢ *delivered message to `{user}` safely.*", ephemeral=True)
+        await safe_respond(ctx, f"╭ ⟢ *delivered message to `{user}` safely.*", ephemeral=True)
     except Exception as e:
-        await ctx.send(f"╭ ☁️ *failed to send dm:* `{e}`", ephemeral=True)
+        await safe_respond(ctx, f"╭ ☁️ *failed to send dm:* `{e}`", ephemeral=True)
 
 @bot.hybrid_command(name="status", description="Owner: set the bot presence status.")
 @app_commands.describe(state="Status mode: online, idle, or dnd")
+@app_commands.choices(state=[
+    app_commands.Choice(name="Online 🟢", value="online"),
+    app_commands.Choice(name="Idle 🌙", value="idle"),
+    app_commands.Choice(name="Do Not Disturb ⛔", value="dnd"),
+])
 async def status(ctx: commands.Context, state: str):
     if not is_owner_check(ctx):
         return
@@ -822,27 +850,51 @@ async def status(ctx: commands.Context, state: str):
     }
     chosen = status_map.get(state.lower())
     if not chosen:
-        return await ctx.send("╭ ☁️ *pick from:* `online`, `idle`, or `dnd`", ephemeral=True)
+        return await safe_respond(ctx, "╭ ☁️ *pick from:* `online`, `idle`, or `dnd`", ephemeral=True)
 
     await bot.change_presence(status=chosen, activity=discord.Activity(type=discord.ActivityType.listening, name="aesthetic tunes | iplay"))
-    await ctx.send(f"╭ ⟢ *presence status shifted to `{state}`.*", ephemeral=True)
+    await safe_respond(ctx, f"╭ ⟢ *presence status shifted to `{state}`.*", ephemeral=True)
 
 @bot.hybrid_command(name="platform", description="Owner: change platform spoofing (vr, mobile, normal).")
 @app_commands.describe(mode="Spoof mode: vr, mobile, normal")
+@app_commands.choices(mode=[
+    app_commands.Choice(name="VR Headset 🥽", value="vr"),
+    app_commands.Choice(name="Mobile Device 📱", value="mobile"),
+    app_commands.Choice(name="Normal Desktop 💻", value="normal"),
+])
 async def platform(ctx: commands.Context, mode: str):
     global current_platform
     if not is_owner_check(ctx):
         return
     mode_clean = mode.lower()
     if mode_clean not in ["vr", "mobile", "normal"]:
-        return await ctx.send("╭ ☁️ *modes allowed: `vr`, `mobile`, `normal`*", ephemeral=True)
+        return await safe_respond(ctx, "╭ ☁️ *modes allowed: `vr`, `mobile`, `normal`*", ephemeral=True)
 
     current_platform = mode_clean
-    await ctx.send(f"╭ ⟢ *platform updated to `{mode_clean}`. Reconnecting session...*", ephemeral=True)
+    await safe_respond(ctx, f"╭ ⟢ *platform updated to `{mode_clean}`. Reconnecting session...*", ephemeral=True)
 
+    # Allow response to be fully acknowledged before restarting gateway
+    await asyncio.sleep(1.5)
     ws = bot.ws
     if ws:
         await ws.close(4000)
+
+# ─────────────── Cloud/Railway Healthcheck Web Server ─────────────── #
+
+async def start_web_server():
+    port = os.getenv("PORT")
+    if not port:
+        return
+    app = web.Application()
+    async def handle_ping(request):
+        return web.Response(text="isai music bot is healthy and serene ☁️")
+    app.router.add_get("/", handle_ping)
+    app.router.add_get("/health", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", int(port))
+    await site.start()
+    print(f"╭ ⟢ Railway healthcheck web server running on port {port}")
 
 # ─────────────── Events & Startup ─────────────── #
 
@@ -864,8 +916,15 @@ async def on_ready():
         activity=discord.Activity(type=discord.ActivityType.listening, name="ihelp | soft lofi ☁️")
     )
 
+async def main():
+    async with bot:
+        await asyncio.gather(
+            start_web_server(),
+            bot.start(TOKEN)
+        )
+
 if __name__ == "__main__":
     if not TOKEN:
         print("Error: No TOKEN found inside .env file.")
         sys.exit(1)
-    bot.run(TOKEN)
+    asyncio.run(main())
