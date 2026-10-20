@@ -1,0 +1,17 @@
+{
+  "name": "isai-music-bot",
+  "version": "1.0.0",
+  "description": "An aesthetic, lightweight Discord music bot powered by Lavalink & Poru",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5",
+    "poru": "^5.3.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
