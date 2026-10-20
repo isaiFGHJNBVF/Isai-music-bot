@@ -1,1276 +1,977 @@
-"""Isai — a Discord music bot powered by a Lavalink node."""
+require('dotenv').config();
+const {
+  Client,
+  GatewayIntentBits,
+  EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  SlashCommandBuilder,
+  ActivityType,
+  Events
+} = require('discord.js');
+const { Poru } = require('poru');
 
-from __future__ import annotations
+// ==========================================
+// 🛡️ ANTI-CRASH PROTECTION SYSTEM
+// ==========================================
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[Anti-Crash] Unhandled Rejection:', reason);
+});
+process.on('uncaughtException', (err, origin) => {
+  console.error('[Anti-Crash] Uncaught Exception:', err);
+});
 
-import asyncio
-import logging
-import os
-import random
-import re
-import time
-from collections import deque
-from dataclasses import dataclass, field
-from typing import Any
-from urllib.parse import urlparse
+// ==========================================
+// 🌸 BOT CONFIGURATION & SETTINGS
+// ==========================================
+let prefix = 'i';
+const owner = ['1377967442172579843', '774224543531270144'];
+const THEME_COLOR = 0xf3c4db; // Aesthetic sakura blush
 
-import aiohttp
-import discord
-import wavelink
-from discord import app_commands
-from discord.ext import commands
-from dotenv import load_dotenv
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.MessageContent
+  ]
+});
 
+// Lavalink Node Setup
+const nodes = [
+  {
+    name: 'Isai-Core',
+    host: process.env.LAVALINK_HOST || 'lavalink.jirayu.net',
+    port: parseInt(process.env.LAVALINK_PORT || '13592', 10),
+    password: process.env.LAVALINK_PASSWORD || 'youshallnotpass',
+    secure: process.env.LAVALINK_SECURE === 'true'
+  }
+];
 
-load_dotenv()
+// Poru Audio Engine (Default: YouTube)
+client.poru = new Poru(client, nodes, {
+  library: 'discord.js',
+  defaultPlatform: 'ytsearch'
+});
 
-TOKEN = os.getenv("TOKEN", "").strip()
-SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "").strip()
-SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "").strip()
-PREFIX = os.getenv("PREFIX", "i").strip() or "i"
+// Safe guild-level storage
+const activePanels = new Map();
+const guildState = new Map();
 
-LAVALINK_HOST = os.getenv("LAVALINK_HOST", "ryzen.heavencloud.in").strip()
-LAVALINK_PORT = os.getenv("LAVALINK_PORT", "2426").strip()
-LAVALINK_SECURE = os.getenv("LAVALINK_SECURE", "false").strip().lower() in {
-    "1",
-    "true",
-    "yes",
+function getState(guildId) {
+  if (!guildState.has(guildId)) {
+    guildState.set(guildId, { bassboost: false, previousTrack: null });
+  }
+  return guildState.get(guildId);
 }
-LAVALINK_IDENTIFIER = os.getenv(
-    "LAVALINK_IDENTIFIER", "LAVALINK-ZYNRAX DEV"
-).strip()
-LAVALINK_PASSWORD = os.getenv("LAVALINK_PASSWORD", "").strip()
 
-# These accounts can use the private owner commands.
-owner = [1377967442172579843, 774224543531270144]
-OWNER_IDS = set(owner)
+// Format Milliseconds to MM:SS
+function formatTime(ms) {
+  if (!ms || isNaN(ms)) return '00:00';
+  const totalSeconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+}
 
-EMBED_COLOR = discord.Color.from_rgb(244, 166, 193)
-MAX_QUEUE_SIZE = 500
-MAX_PLAYLIST_ITEMS = 100
-MAX_SPOTIFY_ITEMS = 100
+// Aesthetic Visual Slider
+function renderProgressBar(current, total, length = 12) {
+  if (total <= 0) return '━'.repeat(length);
+  const ratio = Math.min(Math.max(current / total, 0), 1);
+  const passed = Math.round(length * ratio);
+  const remaining = length - passed;
+  return '━'.repeat(passed) + '🔘' + '─'.repeat(Math.max(0, remaining - 1));
+}
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
-log = logging.getLogger("isai")
+// ==========================================
+// 🖼️ REAL SONG THUMBNAIL RESOLVER
+// ==========================================
+function getTrackThumbnail(track) {
+  if (!track || !track.info) return null;
+  const info = track.info;
 
+  // 1. Lavalink v4 artworkUrl (Spotify / SoundCloud / YouTube)
+  if (info.artworkUrl && typeof info.artworkUrl === 'string' && info.artworkUrl.startsWith('http')) {
+    return info.artworkUrl;
+  }
 
-@dataclass(slots=True)
-class Track:
-    playable: wavelink.Playable
-    requester: str
+  // 2. Poru image field
+  if (info.image && typeof info.image === 'string' && info.image.startsWith('http')) {
+    return info.image;
+  }
 
-    @property
-    def title(self) -> str:
-        return self.playable.title or "Untitled track"
+  // 3. Extract YouTube Video ID from identifier or URL
+  let ytId = null;
+  if (info.identifier && info.identifier.length === 11) {
+    ytId = info.identifier;
+  } else if (info.uri) {
+    const match = info.uri.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|shorts\/))([\w-]{11})/);
+    if (match && match[1]) ytId = match[1];
+  }
 
-    @property
-    def url(self) -> str:
-        return self.playable.uri or ""
+  if (ytId) {
+    return `https://i.ytimg.com/vi/${ytId}/hqdefault.jpg`;
+  }
 
-    @property
-    def duration(self) -> int | None:
-        if self.playable.is_stream or not self.playable.length:
-            return None
-        return round(self.playable.length / 1000)
+  return null;
+}
 
-    @property
-    def thumbnail(self) -> str:
-        return self.playable.artwork or ""
+// Safe Stop Method for Poru
+function stopMusic(player, guildId) {
+  clearTicker(guildId);
+  if (!player) return;
+  player.queue.clear();
+  try {
+    if (typeof player.stop === 'function') {
+      player.stop();
+    } else {
+      player.skip(); // Safely skips the track with an empty queue, ending playback cleanly
+    }
+  } catch (err) {
+    console.error('[Isai Stop Error]:', err.message);
+  }
+}
 
+// ==========================================
+// 🧸 AESTHETIC PLAYER PANEL BUILDER
+// ==========================================
+function buildPanelEmbed(player, track) {
+  const state = getState(player.guildId);
+  const position = player.position || 0;
+  const duration = track.info.length || 0;
+  const isStream = track.info.isStream;
+  const progressBar = isStream
+    ? '🔴 ʟɪᴠᴇ sᴛʀᴇᴀᴍ'
+    : `${formatTime(position)} ${renderProgressBar(position, duration, 10)} ${formatTime(duration)}`;
 
-@dataclass
-class GuildState:
-    queue: deque[Track] = field(default_factory=deque)
-    history: deque[Track] = field(default_factory=lambda: deque(maxlen=50))
-    current: Track | None = None
-    loop_mode: str = "off"
-    bass: bool = False
-    started_at: float | None = None
-    elapsed_before_pause: float = 0.0
-    paused_at: float | None = None
-    suppress_after: bool = False
-    panel_channel_id: int | None = None
-    panel_message_id: int | None = None
-    start_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+  const loopIcon = player.loop === 'TRACK' ? '🔂 Song' : player.loop === 'QUEUE' ? '🔁 Queue' : 'Off';
+  const isBass = state.bassboost ? '🔊 Active' : '🔈 Standard';
 
-
-states: dict[int, GuildState] = {}
-
-
-def state_for(guild_id: int) -> GuildState:
-    return states.setdefault(guild_id, GuildState())
-
-
-def format_time(seconds: int | float | None) -> str:
-    if seconds is None or seconds < 0:
-        return "LIVE"
-    total = int(seconds)
-    hours, remainder = divmod(total, 3600)
-    minutes, secs = divmod(remainder, 60)
-    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
-
-
-def elapsed_time(state: GuildState) -> float:
-    if state.paused_at is not None:
-        return state.elapsed_before_pause
-    if state.started_at is None:
-        return 0.0
-    return state.elapsed_before_pause + max(0.0, time.monotonic() - state.started_at)
-
-
-def make_progress_bar(state: GuildState, width: int = 16) -> str:
-    track = state.current
-    duration = track.duration if track else None
-    if not duration:
-        return "─" * width
-    ratio = min(1.0, elapsed_time(state) / max(duration, 1))
-    filled = round(ratio * width)
-    return "▰" * filled + "▱" * (width - filled)
-
-
-def make_player_embed(state: GuildState) -> discord.Embed:
-    current = state.current
-    if current:
-        title = discord.utils.escape_markdown(current.title)
-        linked_title = f"[{title}]({current.url})" if current.url else title
-        status = "⏸️ Paused" if state.paused_at is not None else "🎶 Now playing"
-        description = (
-            f"{status}\n**{linked_title}**\n\n"
-            f"`{format_time(elapsed_time(state))}` {make_progress_bar(state)} "
-            f"`{format_time(current.duration)}`\n"
-            "_Visual progress only; this bar does not seek._"
-        )
-        embed = discord.Embed(
-            title="🌸 isai's little listening room",
-            description=description,
-            color=EMBED_COLOR,
-        )
-        if current.thumbnail:
-            embed.set_thumbnail(url=current.thumbnail)
-        embed.add_field(name="Requested by", value=current.requester, inline=True)
-        embed.add_field(name="Up next", value=str(len(state.queue)), inline=True)
-        embed.add_field(name="Repeat", value=state.loop_mode.title(), inline=True)
-        embed.add_field(
-            name="Bass boost",
-            value="On for next song" if state.bass else "Off",
-            inline=True,
-        )
-        return embed
-
-    if state.queue:
-        description = (
-            f"✨ Up next: **{discord.utils.escape_markdown(state.queue[0].title)}**"
-        )
-    else:
-        description = "The queue is empty. Add a song with `/play` or `iplay`."
-    return discord.Embed(
-        title="🌸 isai's little listening room",
-        description=description,
-        color=EMBED_COLOR,
+  const embed = new EmbedBuilder()
+    .setColor(THEME_COLOR)
+    .setAuthor({ name: '⋆˚࿔ 𝐧𝐨𝐰 𝐩𝐥𝐚𝐲𝐢𝐧𝐠 𝜗𝜚˚⋆', iconURL: client.user.displayAvatarURL() })
+    .setTitle(track.info.title.substring(0, 70))
+    .setURL(track.info.uri)
+    .setDescription(
+      `💽 **Title:** [${track.info.title}](${track.info.uri})\n` +
+      `**Author:** \`${track.info.author}\`\n` +
+      `**Requested By:** <@${track.info.requester?.id || track.info.requester}>\n` +
+      `**Duration:** \`${formatTime(duration)}\`\n\n` +
+      `${progressBar}\n`
     )
-
-
-def queue_embed(state: GuildState) -> discord.Embed:
-    embed = discord.Embed(title="📜 isai's queue", color=EMBED_COLOR)
-    if state.current:
-        embed.add_field(
-            name="Now playing",
-            value=f"**{discord.utils.escape_markdown(state.current.title)}**",
-            inline=False,
-        )
-    if state.queue:
-        rows = [
-            f"`{index:02}` {discord.utils.escape_markdown(track.title)} "
-            f"`{format_time(track.duration)}`"
-            for index, track in enumerate(list(state.queue)[:20], start=1)
-        ]
-        if len(state.queue) > 20:
-            rows.append(f"_and {len(state.queue) - 20} more…_")
-        embed.add_field(name="Coming up", value="\n".join(rows), inline=False)
-    else:
-        embed.description = "Nothing queued yet. Add a song with `/play` or `iplay`."
-    embed.set_footer(text=f"{len(state.queue)} waiting • repeat {state.loop_mode}")
-    return embed
-
-
-class SpotifyResolver:
-    """Read Spotify metadata only; all audio playback is handled by Lavalink."""
-
-    def __init__(self) -> None:
-        self.session: aiohttp.ClientSession | None = None
-        self.access_token: str | None = None
-        self.token_expires_at = 0.0
-
-    async def start(self) -> None:
-        self.session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=20)
-        )
-
-    async def close(self) -> None:
-        if self.session and not self.session.closed:
-            await self.session.close()
-
-    async def _get_token(self) -> str:
-        if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
-            raise ValueError(
-                "Add SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET to your "
-                "environment, or make sure Lavalink has a Spotify source plugin."
-            )
-        if not self.session:
-            raise RuntimeError("Spotify lookup is not ready.")
-        if self.access_token and time.time() < self.token_expires_at - 30:
-            return self.access_token
-
-        async with self.session.post(
-            "https://accounts.spotify.com/api/token",
-            auth=aiohttp.BasicAuth(SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET),
-            data={"grant_type": "client_credentials"},
-        ) as response:
-            if response.status >= 400:
-                raise ValueError(
-                    f"Spotify credentials were rejected (HTTP {response.status})."
-                )
-            data = await response.json()
-        self.access_token = data["access_token"]
-        self.token_expires_at = time.time() + int(data.get("expires_in", 3600))
-        return self.access_token
-
-    async def _get_json(self, url: str) -> dict[str, Any]:
-        if not self.session:
-            raise RuntimeError("Spotify lookup is not ready.")
-        token = await self._get_token()
-        async with self.session.get(
-            url,
-            headers={"Authorization": f"Bearer {token}"},
-        ) as response:
-            if response.status >= 400:
-                raise ValueError(
-                    f"Spotify could not read that public link (HTTP {response.status})."
-                )
-            return await response.json()
-
-    async def tracks_from_link(self, url: str) -> list[str]:
-        parsed = urlparse(url)
-        match = re.search(r"/(track|playlist|album)/([A-Za-z0-9]+)", parsed.path)
-        if parsed.netloc.lower() not in {"open.spotify.com", "www.open.spotify.com"} or not match:
-            raise ValueError("Use a Spotify track, album, or playlist link.")
-
-        kind, spotify_id = match.groups()
-        if kind == "track":
-            data = await self._get_json(
-                f"https://api.spotify.com/v1/tracks/{spotify_id}"
-            )
-            return [self._make_query(data)]
-
-        if kind == "album":
-            url = (
-                f"https://api.spotify.com/v1/albums/{spotify_id}/tracks"
-                f"?limit={MAX_SPOTIFY_ITEMS}"
-            )
-            data = await self._get_json(url)
-            entries = data.get("items", [])
-        else:
-            url = (
-                f"https://api.spotify.com/v1/playlists/{spotify_id}/tracks"
-                f"?limit={MAX_SPOTIFY_ITEMS}"
-            )
-            data = await self._get_json(url)
-            entries = [item.get("track") for item in data.get("items", [])]
-
-        queries = [
-            self._make_query(track)
-            for track in entries
-            if track and track.get("name")
-        ][:MAX_SPOTIFY_ITEMS]
-        if not queries:
-            raise ValueError("No tracks were found in that Spotify collection.")
-        return queries
-
-    @staticmethod
-    def _make_query(track: dict[str, Any]) -> str:
-        title = str(track.get("name") or "Unknown track")
-        artists = ", ".join(
-            artist.get("name", "") for artist in track.get("artists", [])
-        ).strip(", ")
-        return f"{title} {artists}".strip()
-
-
-spotify = SpotifyResolver()
-
-
-def playable_list(result: wavelink.Search) -> list[wavelink.Playable]:
-    if isinstance(result, wavelink.Playlist):
-        return list(result)[:MAX_PLAYLIST_ITEMS]
-    return list(result)[:MAX_PLAYLIST_ITEMS]
-
-
-def wrap_playable(playable: wavelink.Playable, requester: str) -> Track:
-    return Track(playable=playable, requester=requester)
-
-
-async def search_one(query: str) -> wavelink.Playable | None:
-    results = await wavelink.Playable.search(
-        query,
-        source=wavelink.TrackSource.YouTubeMusic,
+    .addFields(
+      { name: '୨ৎ Loop', value: `\`${loopIcon}\``, inline: true },
+      { name: '୨ৎ Bass', value: `\`${isBass}\``, inline: true },
+      { name: '୨ৎ In Queue', value: `\`${player.queue.length} track(s)\``, inline: true }
     )
-    tracks = playable_list(results)
-    return tracks[0] if tracks else None
+    .setFooter({ text: 'Isai • Pure aesthetic vibes ♡', iconURL: client.user.displayAvatarURL() });
 
+  const songCover = getTrackThumbnail(track);
+  if (songCover) {
+    embed.setThumbnail(songCover);
+  }
 
-async def tracks_from_request(query: str, requester: str) -> list[Track]:
-    if "open.spotify.com/" in query.lower():
-        # Prefer LavaSrc/native source plugins when installed on the node.
-        try:
-            direct_results = await wavelink.Playable.search(query)
-            direct_tracks = playable_list(direct_results)
-            if direct_tracks:
-                return [wrap_playable(track, requester) for track in direct_tracks]
-        except (wavelink.LavalinkException, wavelink.LavalinkLoadException):
-            pass
+  return embed;
+}
 
-        queries = await spotify.tracks_from_link(query)
-        semaphore = asyncio.Semaphore(4)
+function buildPanelButtons(player) {
+  const state = getState(player.guildId);
+  const row1 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('btn_prev').setEmoji('⏮️').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId('btn_pause')
+      .setEmoji(player.isPaused ? '▶️' : '⏸️')
+      .setStyle(player.isPaused ? ButtonStyle.Success : ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('btn_skip').setEmoji('⏭️').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('btn_stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger)
+  );
 
-        async def resolve_spotify_query(text: str) -> wavelink.Playable | None:
-            async with semaphore:
-                try:
-                    return await search_one(text)
-                except (wavelink.LavalinkException, wavelink.LavalinkLoadException):
-                    return None
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('btn_loop')
+      .setLabel('Loop')
+      .setEmoji('🔁')
+      .setStyle(player.loop !== 'NONE' ? ButtonStyle.Primary : ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('btn_shuffle').setLabel('Shuffle').setEmoji('🔀').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId('btn_bass')
+      .setLabel('Bass')
+      .setEmoji('🎧')
+      .setStyle(state.bassboost ? ButtonStyle.Success : ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('btn_queue').setLabel('Queue').setEmoji('📜').setStyle(ButtonStyle.Secondary)
+  );
 
-        resolved = await asyncio.gather(*(resolve_spotify_query(text) for text in queries))
-        tracks = [
-            wrap_playable(track, requester)
-            for track in resolved
-            if track is not None
-        ]
-        if not tracks:
-            raise ValueError(
-                "I couldn’t find playable results for that Spotify link. "
-                "Check the Lavalink source plugins and Spotify credentials."
-            )
-        return tracks
+  return [row1, row2];
+}
 
-    try:
-        results = await wavelink.Playable.search(query)
-    except wavelink.LavalinkLoadException as error:
-        raise ValueError(
-            "Lavalink could not load that source. The server may need its "
-            "YouTube/source plugin enabled."
-        ) from error
-    except wavelink.LavalinkException as error:
-        raise ValueError("Could not search the Lavalink node. Try again shortly.") from error
+function clearTicker(guildId) {
+  const existing = activePanels.get(guildId);
+  if (existing?.interval) {
+    clearInterval(existing.interval);
+    activePanels.delete(guildId);
+  }
+}
 
-    tracks = playable_list(results)
-    if not tracks:
-        raise ValueError("I couldn’t find a playable song for that title or link.")
-    return [wrap_playable(track, requester) for track in tracks]
+// ==========================================
+// 🎵 PORU (LAVALINK) EVENTS
+// ==========================================
+client.poru.on('nodeConnect', (node) => {
+  console.log(`[Isai Audio] Connected to Lavalink Node: ${node.name} ✨`);
+});
 
+client.poru.on('nodeError', (node, error) => {
+  console.log(`[Isai Audio Error] ${node.name}:`, error.message);
+});
 
-def make_filters(bass_enabled: bool) -> wavelink.Filters:
-    filters = wavelink.Filters()
-    if bass_enabled:
-        filters.equalizer.set(
-            bands=[
-                {"band": 0, "gain": 0.10},
-                {"band": 1, "gain": 0.16},
-                {"band": 2, "gain": 0.22},
-                {"band": 3, "gain": 0.18},
-                {"band": 4, "gain": 0.10},
-            ]
+client.poru.on('trackStart', async (player, track) => {
+  clearTicker(player.guildId);
+
+  const channel = client.channels.cache.get(player.textChannel);
+  if (!channel) return;
+
+  const panelMsg = await channel.send({
+    embeds: [buildPanelEmbed(player, track)],
+    components: buildPanelButtons(player)
+  }).catch(() => null);
+
+  if (!panelMsg) return;
+
+  // Real-time slider bar ticker (every 5 seconds)
+  const interval = setInterval(async () => {
+    if (!player.isPlaying || player.isPaused) return;
+    try {
+      await panelMsg.edit({
+        embeds: [buildPanelEmbed(player, track)],
+        components: buildPanelButtons(player)
+      });
+    } catch {
+      clearTicker(player.guildId);
+    }
+  }, 5000);
+
+  activePanels.set(player.guildId, { msg: panelMsg, interval });
+});
+
+client.poru.on('trackEnd', (player, track) => {
+  const state = getState(player.guildId);
+  state.previousTrack = track;
+  clearTicker(player.guildId);
+});
+
+client.poru.on('queueEnd', (player) => {
+  clearTicker(player.guildId);
+  const channel = client.channels.cache.get(player.textChannel);
+  if (channel) {
+    channel.send({
+      embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('˗ˏˋ 𝜗𝜚 **Queue completed!** Hope you enjoyed the music. `ˎˊ˗')]
+    }).catch(() => null);
+  }
+});
+
+// ==========================================
+// 🚀 SLASH COMMAND DEFINITIONS
+// ==========================================
+const slashCommands = [
+  new SlashCommandBuilder()
+    .setName('play')
+    .setDescription('Play a song from YouTube, Spotify, or direct audio link')
+    .addStringOption(opt =>
+      opt.setName('query')
+        .setDescription('Song title, YouTube URL, or Spotify link')
+        .setRequired(true)
+        .setAutocomplete(true)
+    ),
+  new SlashCommandBuilder().setName('pause').setDescription('Pause playback'),
+  new SlashCommandBuilder().setName('resume').setDescription('Resume playback'),
+  new SlashCommandBuilder().setName('skip').setDescription('Skip to the next song'),
+  new SlashCommandBuilder().setName('previous').setDescription('Play previous song'),
+  new SlashCommandBuilder().setName('stop').setDescription('Stop playback and clear queue'),
+  new SlashCommandBuilder().setName('connect').setDescription('Join your voice channel'),
+  new SlashCommandBuilder().setName('disconnect').setDescription('Leave voice channel'),
+  new SlashCommandBuilder().setName('shuffle').setDescription('Shuffle queue order'),
+  new SlashCommandBuilder().setName('queue').setDescription('View queued songs'),
+  new SlashCommandBuilder().setName('clear').setDescription('Clear the queue'),
+  new SlashCommandBuilder()
+    .setName('remove')
+    .setDescription('Remove a song by index or title')
+    .addStringOption(opt => opt.setName('target').setDescription('Song number or title').setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('bass')
+    .setDescription('Toggle high-quality bass boost')
+    .addBooleanOption(opt => opt.setName('enabled').setDescription('Enable or disable bass boost').setRequired(true)),
+  new SlashCommandBuilder().setName('loop').setDescription('Change repeat/loop modes'),
+  new SlashCommandBuilder().setName('help').setDescription('Aesthetic overview of all Isai commands'),
+
+  // Owner Only Slash Commands
+  new SlashCommandBuilder()
+    .setName('say')
+    .setDescription('Broadcast a message (Owner Only)')
+    .addStringOption(opt => opt.setName('content').setDescription('Message content').setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('dm')
+    .setDescription('Send a direct message to a user (Owner Only)')
+    .addUserOption(opt => opt.setName('target').setDescription('Target user').setRequired(true))
+    .addStringOption(opt => opt.setName('content').setDescription('Message text').setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('status')
+    .setDescription('Update bot presence (Owner Only)')
+    .addStringOption(opt =>
+      opt.setName('type')
+        .setDescription('online, idle, or dnd')
+        .setRequired(true)
+        .addChoices(
+          { name: 'Online', value: 'online' },
+          { name: 'Idle', value: 'idle' },
+          { name: 'Do Not Disturb', value: 'dnd' }
         )
-    return filters
-
-
-class IsaiBot(commands.Bot):
-    def __init__(self) -> None:
-        intents = discord.Intents.default()
-        intents.message_content = True
-        super().__init__(
-            command_prefix=commands.when_mentioned_or(PREFIX),
-            intents=intents,
-            help_command=None,
-        )
-        self.lavalink_session: aiohttp.ClientSession | None = None
-
-    async def setup_hook(self) -> None:
-        await spotify.start()
-        try:
-            synced = await self.tree.sync()
-            log.info("Synced %d slash commands.", len(synced))
-        except discord.HTTPException:
-            log.exception("Could not sync slash commands.")
-
-        scheme = "https" if LAVALINK_SECURE else "http"
-        self.lavalink_session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=30)
-        )
-        node = wavelink.Node(
-            identifier=LAVALINK_IDENTIFIER,
-            uri=f"{scheme}://{LAVALINK_HOST}:{LAVALINK_PORT}",
-            password=LAVALINK_PASSWORD,
-            client=self,
-            session=self.lavalink_session,
-        )
-        try:
-            connected = await wavelink.Pool.connect(nodes=[node], client=self)
-            if LAVALINK_IDENTIFIER not in connected:
-                raise RuntimeError(
-                    "Lavalink node connection failed. Check the host, port, "
-                    "password, server version, and secure setting."
-                )
-        except Exception:
-            await self.lavalink_session.close()
-            self.lavalink_session = None
-            raise
-
-    async def close(self) -> None:
-        await spotify.close()
-        await wavelink.Pool.close()
-        if self.lavalink_session and not self.lavalink_session.closed:
-            await self.lavalink_session.close()
-        await super().close()
-
-
-bot = IsaiBot()
-
-
-def is_player(voice: discord.VoiceClient | None) -> bool:
-    return isinstance(voice, wavelink.Player)
-
-
-async def ensure_voice(
-    guild: discord.Guild, member: discord.Member
-) -> wavelink.Player:
-    if not member.voice or not member.voice.channel:
-        raise ValueError("Join a voice channel first, and I’ll meet you there.")
-
-    voice = guild.voice_client
-    if is_player(voice):
-        assert isinstance(voice, wavelink.Player)
-        if not voice.connected:
-            await voice.connect(reconnect=True)
-        if voice.channel != member.voice.channel:
-            await voice.move_to(member.voice.channel)
-        return voice
-
-    connected = await member.voice.channel.connect(
-        cls=wavelink.Player,
-        self_deaf=True,
     )
-    if not isinstance(connected, wavelink.Player):
-        raise RuntimeError("Could not create the Lavalink voice player.")
-    return connected
+];
 
+// ==========================================
+// 💡 READY & INSTANT SLASH COMMAND SYNC
+// ==========================================
+client.once(Events.ClientReady, async () => {
+  client.poru.init(client);
+  console.log(`[Isai] Logged in as ${client.user.tag} ♡`);
 
-async def refresh_panel(
-    state: GuildState,
-    channel: discord.abc.Messageable | None = None,
-) -> None:
-    if channel is not None and hasattr(channel, "id"):
-        state.panel_channel_id = channel.id  # type: ignore[attr-defined]
+  try {
+    for (const guild of client.guilds.cache.values()) {
+      await guild.commands.set(slashCommands).catch(() => {});
+    }
+    await client.application.commands.set(slashCommands).catch(() => {});
+    console.log('[Isai] Slash commands synced instantly to all connected guilds! 🌸');
+  } catch (err) {
+    console.error('[Isai Command Sync Error]:', err);
+  }
 
-    target: Any = channel
-    if target is None and state.panel_channel_id:
-        target = bot.get_channel(state.panel_channel_id)
-        if target is None:
-            try:
-                target = await bot.fetch_channel(state.panel_channel_id)
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                return
-    if target is None:
-        return
+  client.user.setPresence({
+    status: 'idle',
+    activities: [{ name: `${prefix}help | 𝜗𝜚 aesthetic tunes`, type: ActivityType.Listening }]
+  });
+});
 
-    paused = state.paused_at is not None
-    embed = make_player_embed(state)
-    view = PlayerPanelView(paused=paused)
-    if state.panel_message_id:
-        try:
-            message = await target.fetch_message(state.panel_message_id)
-            await message.edit(embed=embed, view=view)
-            return
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            state.panel_message_id = None
-    try:
-        message = await target.send(embed=embed, view=view)
-        state.panel_message_id = message.id
-    except (discord.Forbidden, discord.HTTPException):
-        log.info("Cannot post the player panel in channel %s.", target.id)
+client.on(Events.GuildCreate, async (guild) => {
+  await guild.commands.set(slashCommands).catch(() => {});
+});
 
+// ==========================================
+// 🔍 YOUTUBE AUTOCOMPLETE
+// ==========================================
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isAutocomplete()) return;
 
-async def start_next(guild_id: int) -> None:
-    guild = bot.get_guild(guild_id)
-    state = state_for(guild_id)
-    voice = guild.voice_client if guild else None
-    if not is_player(voice) or not voice.connected:
-        state.current = None
-        return
-    assert isinstance(voice, wavelink.Player)
+  if (interaction.commandName === 'play') {
+    const focusedValue = interaction.options.getFocused();
+    if (!focusedValue || focusedValue.trim().length === 0) {
+      return interaction.respond([]);
+    }
 
-    async with state.start_lock:
-        if voice.playing or voice.paused:
-            return
-        while state.queue:
-            track = state.queue.popleft()
-            state.current = track
-            try:
-                await voice.play(
-                    track.playable,
-                    filters=make_filters(state.bass),
-                    volume=100,
-                )
-                state.started_at = time.monotonic()
-                state.elapsed_before_pause = 0.0
-                state.paused_at = None
-                await refresh_panel(state)
-                return
-            except (wavelink.LavalinkException, discord.HTTPException) as error:
-                log.warning("Could not start %s: %s", track.title, error)
-                state.current = None
-                state.started_at = None
-                if state.panel_channel_id:
-                    await send_channel_message(
-                        state.panel_channel_id,
-                        f"Couldn’t play **{discord.utils.escape_markdown(track.title)}**; "
-                        "I’ll try the next song.",
-                    )
+    try {
+      const res = await client.poru.resolve({ query: focusedValue, source: 'ytsearch' });
+      if (!res || !res.tracks || res.tracks.length === 0) {
+        return interaction.respond([]);
+      }
 
-        state.current = None
-        state.started_at = None
-        state.elapsed_before_pause = 0.0
-        state.paused_at = None
-        await refresh_panel(state)
+      const choices = res.tracks.slice(0, 7).map(track => {
+        const title = track.info.title.length > 70 ? track.info.title.substring(0, 67) + '...' : track.info.title;
+        return {
+          name: `▶ ${title} (${track.info.author})`.substring(0, 100),
+          value: track.info.uri
+        };
+      });
 
+      await interaction.respond(choices);
+    } catch {
+      await interaction.respond([]).catch(() => {});
+    }
+  }
+});
 
-async def send_channel_message(channel_id: int, message: str) -> None:
-    channel = bot.get_channel(channel_id)
-    if channel:
-        try:
-            await channel.send(
-                message,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-        except (discord.Forbidden, discord.HTTPException):
-            pass
+// ==========================================
+// 🎛️ CORE MUSIC ENGINE EXECUTOR
+// ==========================================
+async function executePlay(guild, member, channel, query, sendReply) {
+  const voiceChannel = member.voice.channel;
+  if (!voiceChannel) {
+    return sendReply({
+      embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('🌸 **Please join a voice channel first!**')]
+    });
+  }
 
+  const permissions = voiceChannel.permissionsFor(client.user);
+  if (!permissions.has('Connect') || !permissions.has('Speak')) {
+    return sendReply({
+      embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('⚠️ **I need connect and speak permissions in your voice channel!**')]
+    });
+  }
 
-async def add_tracks(
-    guild: discord.Guild,
-    member: discord.Member,
-    channel: discord.abc.Messageable,
-    query: str,
-) -> tuple[int, str]:
-    voice = await ensure_voice(guild, member)
-    found = await tracks_from_request(query, member.display_name)
-    state = state_for(guild.id)
-    if len(state.queue) + len(found) > MAX_QUEUE_SIZE:
-        raise ValueError(
-            f"The queue can hold up to {MAX_QUEUE_SIZE} waiting tracks. "
-            "Remove a few before adding this request."
-        )
-    state.queue.extend(found)
-    state.panel_channel_id = channel.id  # type: ignore[attr-defined]
-    await start_next(guild.id)
-    await refresh_panel(state, channel)
-    return len(found), voice.channel.name
+  let player = client.poru.players.get(guild.id);
+  if (!player) {
+    player = client.poru.createConnection({
+      guildId: guild.id,
+      voiceChannel: voiceChannel.id,
+      textChannel: channel.id,
+      deaf: true
+    });
+  }
 
+  const isUrl = /^https?:\/\//i.test(query);
+  const res = await client.poru.resolve({
+    query: query,
+    source: isUrl ? undefined : 'ytsearch',
+    requester: member.user
+  });
 
-async def safe_respond(
-    ctx: commands.Context,
-    content: str | None = None,
-    *,
-    embed: discord.Embed | None = None,
-    view: discord.ui.View | None = None,
-    ephemeral: bool = False,
-) -> discord.Message | discord.InteractionMessage | None:
-    if ctx.interaction:
-        if ctx.interaction.response.is_done():
-            return await ctx.interaction.followup.send(
-                content=content,
-                embed=embed,
-                view=view,
-                ephemeral=ephemeral,
-            )
-        return await ctx.interaction.response.send_message(
-            content=content,
-            embed=embed,
-            view=view,
-            ephemeral=ephemeral,
-        )
-    return await ctx.send(content=content, embed=embed, view=view)
+  if (res.loadType === 'LOAD_FAILED' || res.loadType === 'error') {
+    return sendReply({
+      embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('❌ **Failed to load track or media.**')]
+    });
+  }
 
+  if (res.loadType === 'NO_MATCHES' || res.loadType === 'empty') {
+    return sendReply({
+      embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('🔍 **No songs found for that search query.**')]
+    });
+  }
 
-async def respond_interaction(
-    interaction: discord.Interaction,
-    content: str,
-    *,
-    ephemeral: bool = True,
-) -> None:
-    if interaction.response.is_done():
-        await interaction.followup.send(content, ephemeral=ephemeral)
-    else:
-        await interaction.response.send_message(content, ephemeral=ephemeral)
+  if (res.loadType === 'PLAYLIST_LOADED' || res.loadType === 'playlist') {
+    for (const track of res.tracks) {
+      track.info.requester = member.user;
+      player.queue.add(track);
+    }
 
+    sendReply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(THEME_COLOR)
+          .setDescription(`˚.⋆ 𝜗𝜚 **Added Playlist:** \`${res.playlistInfo.name}\` with **${res.tracks.length}** tracks!`)
+      ]
+    });
+  } else {
+    const track = res.tracks[0];
+    track.info.requester = member.user;
+    player.queue.add(track);
 
-async def player_for_interaction(
-    interaction: discord.Interaction,
-) -> tuple[wavelink.Player, GuildState] | None:
-    if not interaction.guild:
-        await respond_interaction(interaction, "This control works inside a server.")
-        return None
-    voice = interaction.guild.voice_client
-    if not is_player(voice) or not voice.connected:
-        await respond_interaction(interaction, "I’m not in a voice channel right now.")
-        return None
-    member = interaction.user
-    if isinstance(member, discord.Member) and (
-        not member.voice or member.voice.channel != voice.channel
-    ):
-        await respond_interaction(
-            interaction,
-            "Join my voice channel to use these player controls.",
-        )
-        return None
-    assert isinstance(voice, wavelink.Player)
-    return voice, state_for(interaction.guild.id)
+    if (player.isPlaying) {
+      const cover = getTrackThumbnail(track);
+      const queueEmbed = new EmbedBuilder()
+        .setColor(THEME_COLOR)
+        .setDescription(`˗ˏˋ ☕ **Queued:** [${track.info.title}](${track.info.uri})\nPosition: **#${player.queue.length}** ˎˊ˗`);
 
+      if (cover) queueEmbed.setThumbnail(cover);
 
-class PlayerPanelView(discord.ui.View):
-    def __init__(self, *, paused: bool = False) -> None:
-        super().__init__(timeout=30 * 60)
-        for item in self.children:
-            if isinstance(item, discord.ui.Button) and str(item.emoji) == "⏯️":
-                item.label = "Resume" if paused else "Pause"
-                break
+      sendReply({ embeds: [queueEmbed] });
+    }
+  }
 
-    async def _validate(
-        self, interaction: discord.Interaction
-    ) -> tuple[wavelink.Player, GuildState] | None:
-        result = await player_for_interaction(interaction)
-        if result is None:
-            return None
-        await interaction.response.defer(ephemeral=True)
-        return result
+  if (!player.isPlaying && player.isConnected) {
+    player.play();
+  }
+}
 
-    @discord.ui.button(label="Pause", emoji="⏯️", style=discord.ButtonStyle.secondary)
-    async def pause_resume(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        result = await self._validate(interaction)
-        if not result:
-            return
-        voice, state = result
-        if voice.playing:
-            state.elapsed_before_pause = elapsed_time(state)
-            state.paused_at = time.monotonic()
-            await voice.pause(True)
-        elif voice.paused:
-            state.started_at = time.monotonic()
-            state.paused_at = None
-            await voice.pause(False)
-        await refresh_panel(state)
-        await interaction.followup.send("Player updated.", ephemeral=True)
+function setBassBoost(player, enable) {
+  const state = getState(player.guildId);
+  state.bassboost = enable;
 
-    @discord.ui.button(label="Previous", emoji="⏮️", style=discord.ButtonStyle.secondary)
-    async def previous(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        result = await self._validate(interaction)
-        if not result:
-            return
-        voice, state = result
-        if not state.history:
-            await interaction.followup.send(
-                "There isn’t a previous song yet.",
-                ephemeral=True,
-            )
-            return
-        if state.current:
-            state.queue.appendleft(state.current)
-        state.queue.appendleft(state.history.pop())
-        if voice.playing or voice.paused:
-            state.suppress_after = True
-            await voice.stop()
-        else:
-            await start_next(interaction.guild_id)  # type: ignore[arg-type]
-        await interaction.followup.send("Playing the previous song.", ephemeral=True)
+  if (!player.filters) return;
+  if (enable) {
+    player.filters.setEqualizer([
+      { band: 0, gain: 0.25 },
+      { band: 1, gain: 0.20 },
+      { band: 2, gain: 0.15 },
+      { band: 3, gain: 0.10 },
+      { band: 4, gain: 0.05 }
+    ]);
+  } else {
+    player.filters.clearFilters();
+  }
+}
 
-    @discord.ui.button(label="Skip", emoji="⏭️", style=discord.ButtonStyle.primary)
-    async def skip(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        result = await self._validate(interaction)
-        if not result:
-            return
-        voice, _ = result
-        if voice.playing or voice.paused:
-            await voice.stop()
-            await interaction.followup.send("Skipped.", ephemeral=True)
-        else:
-            await interaction.followup.send("Nothing is playing.", ephemeral=True)
+// ==========================================
+// 💬 SLASH COMMAND INTERACTION ROUTING
+// ==========================================
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (interaction.isButton()) {
+    return handleButtonInteraction(interaction);
+  }
 
-    @discord.ui.button(label="Shuffle", emoji="🔀", style=discord.ButtonStyle.secondary)
-    async def shuffle(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        result = await self._validate(interaction)
-        if not result:
-            return
-        _, state = result
-        tracks = list(state.queue)
-        random.shuffle(tracks)
-        state.queue = deque(tracks)
-        await refresh_panel(state)
-        await interaction.followup.send("Queue shuffled.", ephemeral=True)
+  if (!interaction.isChatInputCommand()) return;
 
-    @discord.ui.button(label="Queue", emoji="📜", style=discord.ButtonStyle.secondary)
-    async def show_queue(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        result = await self._validate(interaction)
-        if not result:
-            return
-        _, state = result
-        await interaction.followup.send(
-            embed=queue_embed(state),
-            ephemeral=True,
-        )
+  const { commandName, guild, member, channel, user } = interaction;
+  const isOwner = owner.includes(user.id);
 
-    @discord.ui.button(label="Stop", emoji="⏹️", style=discord.ButtonStyle.danger)
-    async def stop(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        result = await self._validate(interaction)
-        if not result:
-            return
-        voice, state = result
-        state.queue.clear()
-        if voice.playing or voice.paused:
-            state.suppress_after = True
-            await voice.stop()
-        else:
-            state.current = None
-            state.suppress_after = False
-        state.started_at = None
-        state.elapsed_before_pause = 0.0
-        state.paused_at = None
-        await refresh_panel(state)
-        await interaction.followup.send(
-            "Playback stopped and the queue is clear.",
-            ephemeral=True,
-        )
+  if (['say', 'dm', 'status'].includes(commandName) && !isOwner) {
+    return interaction.reply({ content: 'Nothing here.', ephemeral: true });
+  }
 
+  // Owner Commands
+  if (commandName === 'say') {
+    const text = interaction.options.getString('content');
+    await channel.send(text);
+    return interaction.reply({ content: 'Message sent ♡', ephemeral: true });
+  }
 
-def help_embed() -> discord.Embed:
-    embed = discord.Embed(
-        title="🌸 isai — little music commands",
-        description=(
-            f"Use `/command` or the **`{PREFIX}` prefix**, for example "
-            f"`{PREFIX}play lofi`."
-        ),
-        color=EMBED_COLOR,
+  if (commandName === 'dm') {
+    const target = interaction.options.getUser('target');
+    const text = interaction.options.getString('content');
+    try {
+      await target.send(text);
+      return interaction.reply({ content: `Sent to ${target.tag} ✨`, ephemeral: true });
+    } catch {
+      return interaction.reply({ content: `Could not DM ${target.tag}. DMs might be closed.`, ephemeral: true });
+    }
+  }
+
+  if (commandName === 'status') {
+    const statusType = interaction.options.getString('type');
+    client.user.setPresence({ status: statusType });
+    return interaction.reply({ content: `Status set to \`${statusType}\` ✨`, ephemeral: true });
+  }
+
+  // Music Commands
+  const player = client.poru.players.get(guild.id);
+
+  if (commandName === 'play') {
+    await interaction.deferReply();
+    const query = interaction.options.getString('query');
+    return executePlay(guild, member, channel, query, (opts) => interaction.editReply(opts));
+  }
+
+  if (commandName === 'connect') {
+    if (!member.voice.channel) {
+      return interaction.reply({ content: 'Join a voice channel first!', ephemeral: true });
+    }
+    client.poru.createConnection({
+      guildId: guild.id,
+      voiceChannel: member.voice.channel.id,
+      textChannel: channel.id,
+      deaf: true
+    });
+    return interaction.reply({
+      embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription(`Joined **${member.voice.channel.name}** ♡`)]
+    });
+  }
+
+  if (commandName === 'disconnect') {
+    if (!player) return interaction.reply({ content: 'Not connected to any voice channel.', ephemeral: true });
+    clearTicker(guild.id);
+    player.destroy();
+    return interaction.reply({
+      embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('Disconnected from the voice channel 🌸')]
+    });
+  }
+
+  if (commandName === 'pause') {
+    if (!player) return interaction.reply({ content: 'Nothing is playing.', ephemeral: true });
+    player.pause(true);
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('⏸️ **Playback paused.**')] });
+  }
+
+  if (commandName === 'resume') {
+    if (!player) return interaction.reply({ content: 'Nothing is playing.', ephemeral: true });
+    player.pause(false);
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('▶️ **Playback resumed.**')] });
+  }
+
+  if (commandName === 'skip') {
+    if (!player) return interaction.reply({ content: 'Nothing is playing.', ephemeral: true });
+    player.skip();
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('⏭️ **Skipped track.**')] });
+  }
+
+  if (commandName === 'previous') {
+    if (!player) return interaction.reply({ content: 'Nothing is playing.', ephemeral: true });
+    const state = getState(guild.id);
+    if (!state.previousTrack) return interaction.reply({ content: 'No previous track recorded in this session.', ephemeral: true });
+    player.queue.unshift(state.previousTrack);
+    player.skip();
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription(`⏮️ Playing previous: **${state.previousTrack.info.title}**`)] });
+  }
+
+  if (commandName === 'stop') {
+    if (!player) return interaction.reply({ content: 'Nothing is playing.', ephemeral: true });
+    stopMusic(player, guild.id);
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('⏹️ **Music stopped and queue cleared.**')] });
+  }
+
+  if (commandName === 'shuffle') {
+    if (!player || player.queue.length === 0) return interaction.reply({ content: 'Not enough songs in queue to shuffle.', ephemeral: true });
+    player.queue.shuffle();
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription(`🔀 **Shuffled ${player.queue.length} track(s)!**`)] });
+  }
+
+  if (commandName === 'clear') {
+    if (!player || player.queue.length === 0) return interaction.reply({ content: 'Queue is already empty.', ephemeral: true });
+    player.queue.clear();
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('🗑️ **Queue cleared completely.**')] });
+  }
+
+  if (commandName === 'remove') {
+    if (!player || player.queue.length === 0) return interaction.reply({ content: 'The queue is empty.', ephemeral: true });
+    const target = interaction.options.getString('target');
+    const index = parseInt(target, 10);
+
+    if (!isNaN(index) && index > 0 && index <= player.queue.length) {
+      const removed = player.queue.remove(index - 1);
+      return interaction.reply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription(`Removed: **${removed[0]?.info.title || target}**`)] });
+    } else {
+      const songIndex = player.queue.findIndex(t => t.info.title.toLowerCase().includes(target.toLowerCase()));
+      if (songIndex !== -1) {
+        const removed = player.queue.remove(songIndex);
+        return interaction.reply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription(`Removed: **${removed[0]?.info.title}**`)] });
+      }
+      return interaction.reply({ content: 'Could not find that track in the queue.', ephemeral: true });
+    }
+  }
+
+  if (commandName === 'bass') {
+    if (!player) return interaction.reply({ content: 'Nothing is playing.', ephemeral: true });
+    const enable = interaction.options.getBoolean('enabled');
+    setBassBoost(player, enable);
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription(`🎧 **Bass boost set to:** \`${enable ? 'ON' : 'OFF'}\``)] });
+  }
+
+  if (commandName === 'loop') {
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('loop_off').setLabel('Off').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('loop_track').setLabel('Track').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('loop_queue').setLabel('Queue').setStyle(ButtonStyle.Success)
+    );
+    const embed = new EmbedBuilder().setColor(THEME_COLOR).setTitle('🔁 Loop Control').setDescription('Choose repeat mode:');
+    return interaction.reply({ embeds: [embed], components: [row] });
+  }
+
+  if (commandName === 'queue') {
+    if (!player || (!player.currentTrack && player.queue.length === 0)) {
+      return interaction.reply({ content: 'Queue is currently empty.', ephemeral: true });
+    }
+    const list = player.queue.slice(0, 10).map((t, i) => `**${i + 1}.** [${t.info.title}](${t.info.uri}) • \`${formatTime(t.info.length)}\``).join('\n');
+    const embed = new EmbedBuilder()
+      .setColor(THEME_COLOR)
+      .setTitle('⋆˚࿔ Current Queue 𝜗𝜚˚⋆')
+      .setDescription(`**Now Playing:** [${player.currentTrack?.info.title}](${player.currentTrack?.info.uri})\n\n` + (list || 'No upcoming songs.'));
+    return interaction.reply({ embeds: [embed] });
+  }
+
+  if (commandName === 'help') {
+    return interaction.reply({ embeds: [buildHelpEmbed()] });
+  }
+});
+
+// ==========================================
+// 🖱️ INTERACTIVE PANEL BUTTON HANDLER
+// ==========================================
+async function handleButtonInteraction(interaction) {
+  const { customId, guild, member } = interaction;
+  const player = client.poru.players.get(guild.id);
+
+  if (customId.startsWith('loop_')) {
+    if (!player) return interaction.reply({ content: 'Player is no longer active.', ephemeral: true });
+    const mode = customId.split('_')[1];
+    if (mode === 'off') player.setLoop('NONE');
+    else if (mode === 'track') player.setLoop('TRACK');
+    else if (mode === 'queue') player.setLoop('QUEUE');
+    return interaction.reply({ content: `Loop set to \`${mode.toUpperCase()}\` 🔁`, ephemeral: true });
+  }
+
+  if (!player) return interaction.reply({ content: 'No music is currently playing.', ephemeral: true });
+  if (!member.voice.channel || member.voice.channel.id !== player.voiceChannel) {
+    return interaction.reply({ content: 'Please join my voice channel to use the controls!', ephemeral: true });
+  }
+
+  await interaction.deferUpdate();
+
+  switch (customId) {
+    case 'btn_pause':
+      player.pause(!player.isPaused);
+      break;
+    case 'btn_skip':
+      player.skip();
+      break;
+    case 'btn_stop':
+      stopMusic(player, guild.id);
+      break;
+    case 'btn_prev':
+      const state = getState(guild.id);
+      if (state.previousTrack) {
+        player.queue.unshift(state.previousTrack);
+        player.skip();
+      }
+      break;
+    case 'btn_shuffle':
+      if (player.queue.length > 1) player.queue.shuffle();
+      break;
+    case 'btn_loop':
+      const nextLoop = player.loop === 'NONE' ? 'TRACK' : player.loop === 'TRACK' ? 'QUEUE' : 'NONE';
+      player.setLoop(nextLoop);
+      break;
+    case 'btn_bass':
+      const curState = getState(guild.id);
+      setBassBoost(player, !curState.bassboost);
+      break;
+    case 'btn_queue':
+      const qList = player.queue.slice(0, 5).map((t, i) => `${i + 1}. ${t.info.title.substring(0, 30)}...`).join('\n');
+      await interaction.followUp({
+        embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription(`**Up Next:**\n${qList || 'No more songs in queue.'}`)],
+        ephemeral: true
+      });
+      break;
+  }
+
+  // Update panel status or disable buttons when stopped
+  const panel = activePanels.get(guild.id);
+  if (customId === 'btn_stop') {
+    if (panel?.msg) {
+      panel.msg.edit({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(THEME_COLOR)
+            .setDescription('˗ˏˋ ⏹️ **Playback stopped and queue cleared.** ˎˊ˗')
+        ],
+        components: []
+      }).catch(() => {});
+    }
+  } else if (panel?.msg && player.currentTrack) {
+    panel.msg.edit({
+      embeds: [buildPanelEmbed(player, player.currentTrack)],
+      components: buildPanelButtons(player)
+    }).catch(() => {});
+  }
+}
+
+// ==========================================
+// ⌨️ UNIVERSAL PREFIX & ALIAS COMMAND ROUTER
+// ==========================================
+client.on(Events.MessageCreate, async (message) => {
+  if (message.author.bot || !message.guild) return;
+  if (!message.content.toLowerCase().startsWith(prefix.toLowerCase())) return;
+
+  let rawContent = message.content.slice(prefix.length).trim();
+  const args = rawContent.split(/ +/);
+  const cmd = args.shift()?.toLowerCase();
+  if (!cmd) return;
+
+  const isOwner = owner.includes(message.author.id);
+  const isMatch = (aliases) => aliases.includes(cmd);
+
+  // --- OWNER PREFIX COMMANDS ---
+  if (isMatch(['say', 'dm', 'status'])) {
+    if (!isOwner) return;
+
+    if (cmd === 'say') {
+      const content = args.join(' ');
+      if (!content) return;
+      await message.delete().catch(() => {});
+      return message.channel.send(content);
+    }
+
+    if (cmd === 'dm') {
+      const targetUser = message.mentions.users.first() || await client.users.fetch(args[0]).catch(() => null);
+      const text = args.slice(1).join(' ');
+      if (!targetUser || !text) return;
+      return targetUser.send(text).then(() => message.react('💌')).catch(() => message.react('❌'));
+    }
+
+    if (cmd === 'status') {
+      const statusType = args[0]?.toLowerCase();
+      if (['online', 'idle', 'dnd'].includes(statusType)) {
+        client.user.setPresence({ status: statusType });
+        return message.react('✨');
+      }
+      return;
+    }
+  }
+
+  // --- MUSIC PREFIX & SHORT ALIAS COMMANDS ---
+  const sendReply = (opts) => message.channel.send(opts);
+  let player = client.poru.players.get(message.guild.id);
+
+  // Play: iplay / ip
+  if (isMatch(['play', 'p'])) {
+    const query = args.join(' ');
+    if (!query) {
+      return sendReply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription(`🌸 Usage: \`${prefix}play <song title / url>\``)] });
+    }
+    return executePlay(message.guild, message.member, message.channel, query, sendReply);
+  }
+
+  // Connect: iconnect / ic / ijoin / ij
+  if (isMatch(['connect', 'c', 'join', 'j'])) {
+    if (!message.member.voice.channel) {
+      return sendReply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('🌸 Please join a voice channel first!')] });
+    }
+    client.poru.createConnection({
+      guildId: message.guild.id,
+      voiceChannel: message.member.voice.channel.id,
+      textChannel: message.channel.id,
+      deaf: true
+    });
+    return sendReply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription(`Joined **${message.member.voice.channel.name}** ♡`)] });
+  }
+
+  // Disconnect: idisconnect / idc / ileave / il
+  if (isMatch(['disconnect', 'dc', 'leave', 'l'])) {
+    if (!player) return sendReply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('🌸 I am not in any voice channel!')] });
+    clearTicker(message.guild.id);
+    player.destroy();
+    return sendReply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('Disconnected from voice channel 🌸')] });
+  }
+
+  // Pause: ipause
+  if (isMatch(['pause'])) {
+    if (!player) return;
+    player.pause(true);
+    return message.react('⏸️');
+  }
+
+  // Resume: iresume / ir
+  if (isMatch(['resume', 'r'])) {
+    if (!player) return;
+    player.pause(false);
+    return message.react('▶️');
+  }
+
+  // Skip: iskip / is / next
+  if (isMatch(['skip', 's', 'next'])) {
+    if (!player) return;
+    player.skip();
+    return message.react('⏭️');
+  }
+
+  // Previous: iprevious / iprev / iback
+  if (isMatch(['previous', 'prev', 'back'])) {
+    if (!player) return;
+    const state = getState(message.guild.id);
+    if (!state.previousTrack) return sendReply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('No previous track found.')] });
+    player.queue.unshift(state.previousTrack);
+    player.skip();
+    return message.react('⏮️');
+  }
+
+  // Stop: istop
+  if (isMatch(['stop'])) {
+    if (!player) return;
+    stopMusic(player, message.guild.id);
+    return message.react('⏹️');
+  }
+
+  // Queue: iqueue / iq
+  if (isMatch(['queue', 'q'])) {
+    if (!player || (!player.currentTrack && player.queue.length === 0)) {
+      return sendReply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('Queue is empty.')] });
+    }
+    const list = player.queue.slice(0, 10).map((t, i) => `**${i + 1}.** [${t.info.title}](${t.info.uri}) • \`${formatTime(t.info.length)}\``).join('\n');
+    const embed = new EmbedBuilder()
+      .setColor(THEME_COLOR)
+      .setTitle('⋆˚࿔ Current Queue 𝜗𝜚˚⋆')
+      .setDescription(
+        `**Now Playing:** [${player.currentTrack?.info.title}](${player.currentTrack?.info.uri})\n\n` +
+        (list || 'No upcoming songs.') +
+        (player.queue.length > 10 ? `\n\n*...and ${player.queue.length - 10} more tracks*` : '')
+      );
+    return sendReply({ embeds: [embed] });
+  }
+
+  // Clear: iclear / iclr / clean
+  if (isMatch(['clear', 'clr', 'clean'])) {
+    if (!player || player.queue.length === 0) return;
+    player.queue.clear();
+    return message.react('🗑️');
+  }
+
+  // Remove: iremove / irm / del
+  if (isMatch(['remove', 'rm', 'del'])) {
+    if (!player || player.queue.length === 0) return;
+    const target = args.join(' ');
+    const index = parseInt(target, 10);
+    if (!isNaN(index) && index > 0 && index <= player.queue.length) {
+      const removed = player.queue.remove(index - 1);
+      return sendReply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription(`Removed: **${removed[0]?.info.title}**`)] });
+    } else {
+      const songIndex = player.queue.findIndex(t => t.info.title.toLowerCase().includes(target.toLowerCase()));
+      if (songIndex !== -1) {
+        const removed = player.queue.remove(songIndex);
+        return sendReply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription(`Removed: **${removed[0]?.info.title}**`)] });
+      }
+    }
+    return sendReply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('Track not found in queue.')] });
+  }
+
+  // Shuffle: ishuffle / ish
+  if (isMatch(['shuffle', 'sh'])) {
+    if (!player || player.queue.length === 0) return sendReply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('Queue has no songs to shuffle.')] });
+    player.queue.shuffle();
+    return message.react('🔀');
+  }
+
+  // Bass: ibass / ibb
+  if (isMatch(['bass', 'bb'])) {
+    if (!player) return;
+    const arg = args[0]?.toLowerCase();
+    const enable = arg === 'true' || arg === 'on' || arg === '1';
+    setBassBoost(player, enable);
+    return sendReply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription(`🎧 **Bass Boost:** \`${enable ? 'ON' : 'OFF'}\``)] });
+  }
+
+  // Loop: iloop / irepeat / rep / lp
+  if (isMatch(['loop', 'repeat', 'repeate', 'rep', 'lp'])) {
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('loop_off').setLabel('Off').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('loop_track').setLabel('Track').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('loop_queue').setLabel('Queue').setStyle(ButtonStyle.Success)
+    );
+    const embed = new EmbedBuilder().setColor(THEME_COLOR).setTitle('🔁 Loop Control').setDescription('Select repeat mode:');
+    return sendReply({ embeds: [embed], components: [row] });
+  }
+
+  // Help: ihelp / ih
+  if (isMatch(['help', 'h'])) {
+    return sendReply({ embeds: [buildHelpEmbed()] });
+  }
+});
+
+// ==========================================
+// 📖 AESTHETIC HELP MENU
+// ==========================================
+function buildHelpEmbed() {
+  return new EmbedBuilder()
+    .setColor(THEME_COLOR)
+    .setAuthor({ name: 'Isai • Music Commands', iconURL: client.user.displayAvatarURL() })
+    .setDescription(
+      `Welcome to **Isai (இசை)** — aesthetic music companion. 𝜗𝜚\n` +
+      `Current Prefix: \`${prefix}\` | All commands work with **Slash (/)** & **Short Aliases**!\n`
     )
-    embed.add_field(
-        name="Music",
-        value=(
-            "`play` — title, YouTube/media link, mix, or Spotify link\n"
-            "`connect` (`c`) · `disconnect` (`dc`) · `stop`\n"
-            "`pause` · `resume` · `skip` · `previous` (`prev`, `back`)\n"
-            "`queue` (`q`) · `remove <position>` · `clear` · `shuffle`\n"
-            "`loop <off|track|queue>` · `bass <true|false>`"
-        ),
-        inline=False,
+    .addFields(
+      {
+        name: '🎧 Playback Commands',
+        value:
+          `\`${prefix}play\` • \`${prefix}p\` • \`/play\` ➔ Play YouTube, Spotify & URL\n` +
+          `\`${prefix}pause\` • \`/pause\` ➔ Pause song\n` +
+          `\`${prefix}resume\` • \`${prefix}r\` • \`/resume\` ➔ Resume song\n` +
+          `\`${prefix}skip\` • \`${prefix}s\` • \`/skip\` ➔ Skip track\n` +
+          `\`${prefix}previous\` • \`${prefix}prev\` • \`/previous\` ➔ Previous song\n` +
+          `\`${prefix}stop\` • \`/stop\` ➔ Stop and clear queue`
+      },
+      {
+        name: '📜 Queue & Audio Controls',
+        value:
+          `\`${prefix}queue\` • \`${prefix}q\` • \`/queue\` ➔ View queued tracks\n` +
+          `\`${prefix}shuffle\` • \`${prefix}sh\` • \`/shuffle\` ➔ Shuffle playlist\n` +
+          `\`${prefix}clear\` • \`${prefix}clr\` • \`/clear\` ➔ Clear full queue\n` +
+          `\`${prefix}remove\` • \`${prefix}rm\` • \`/remove\` ➔ Remove song\n` +
+          `\`${prefix}loop\` • \`${prefix}rep\` • \`/loop\` ➔ Repeat options\n` +
+          `\`${prefix}bass\` • \`${prefix}bb\` • \`/bass\` ➔ Boost bass (true/false)`
+      },
+      {
+        name: '🌸 Voice Connections',
+        value:
+          `\`${prefix}connect\` • \`${prefix}join\` • \`${prefix}c\` • \`${prefix}j\` ➔ Join VC\n` +
+          `\`${prefix}disconnect\` • \`${prefix}leave\` • \`${prefix}dc\` ➔ Leave VC`
+      }
     )
-    embed.add_field(
-        name="Player panel",
-        value="Pause/resume, previous, skip, shuffle, queue, and stop buttons.",
-        inline=False,
-    )
-    embed.add_field(
-        name="Owner only",
-        value=(
-            "`say` · `dm` · `status <online|idle|dnd>` · `platform`\n"
-            "The platform command explains a Discord bot API limitation."
-        ),
-        inline=False,
-    )
-    embed.set_footer(
-        text="Lavalink plays audio; Spotify links are metadata/search only."
-    )
-    return embed
-
-
-async def play_request(
-    ctx: commands.Context,
-    query: str,
-) -> str:
-    if not ctx.guild or not isinstance(ctx.author, discord.Member):
-        raise ValueError("Use this command inside a server.")
-    count, channel_name = await add_tracks(
-        ctx.guild,
-        ctx.author,
-        ctx.channel,
-        query,
-    )
-    if count == 1:
-        return f"Added your song and joined **{channel_name}**."
-    return f"Added **{count} tracks** to the queue and joined **{channel_name}**."
-
-
-def user_is_owner(user: discord.abc.User) -> bool:
-    return user.id in OWNER_IDS
-
-
-async def handle_command_error(
-    ctx: commands.Context,
-    error: commands.CommandError,
-) -> None:
-    if isinstance(error, commands.CommandNotFound):
-        return
-    if isinstance(error, commands.MissingRequiredArgument):
-        await safe_respond(ctx, f"Missing argument: `{error.param.name}`.")
-        return
-    if isinstance(error, commands.BadArgument):
-        await safe_respond(ctx, "I couldn’t understand that argument. Check `/help`.")
-        return
-    log.error("Command error: %s", error)
-    await safe_respond(ctx, "Something went wrong while running that command.")
-
-
-# ----------------------- Hybrid prefix/slash commands -----------------------
-
-
-@bot.hybrid_command(
-    name="play",
-    aliases=["p"],
-    description="Play a song, playlist, mix, or supported media link.",
-)
-@app_commands.describe(query="Song title, YouTube/media link, or Spotify link")
-async def play(ctx: commands.Context, *, query: str) -> None:
-    if ctx.interaction:
-        await ctx.defer(ephemeral=True, thinking=True)
-    try:
-        message = await play_request(ctx, query)
-        await safe_respond(ctx, message, ephemeral=True)
-    except (ValueError, wavelink.LavalinkException, discord.ClientException, discord.Forbidden) as error:
-        await safe_respond(ctx, str(error), ephemeral=True)
-
-
-@bot.hybrid_command(
-    name="connect",
-    aliases=["c", "join"],
-    description="Join your voice channel.",
-)
-async def connect(ctx: commands.Context) -> None:
-    if not ctx.guild or not isinstance(ctx.author, discord.Member):
-        await safe_respond(ctx, "Use this command inside a server.")
-        return
-    try:
-        voice = await ensure_voice(ctx.guild, ctx.author)
-        await safe_respond(ctx, f"Joined **{voice.channel.name}**. Ready when you are.")
-    except (ValueError, discord.ClientException, discord.Forbidden) as error:
-        await safe_respond(ctx, str(error))
-
-
-@bot.hybrid_command(
-    name="disconnect",
-    aliases=["dc", "leave"],
-    description="Leave voice and clear the queue.",
-)
-async def disconnect(ctx: commands.Context) -> None:
-    if not ctx.guild:
-        await safe_respond(ctx, "Use this command inside a server.")
-        return
-    voice = ctx.guild.voice_client
-    if not is_player(voice):
-        await safe_respond(ctx, "I’m not in a voice channel.")
-        return
-    state = state_for(ctx.guild.id)
-    state.queue.clear()
-    if voice.playing or voice.paused:
-        state.suppress_after = True
-        await voice.stop()
-    state.current = None
-    await voice.disconnect()
-    state.suppress_after = False
-    await safe_respond(ctx, "Disconnected and cleared the queue.")
-
-
-@bot.hybrid_command(name="pause", description="Pause the current song.")
-async def pause(ctx: commands.Context) -> None:
-    voice = ctx.guild.voice_client if ctx.guild else None
-    if not is_player(voice) or not voice.playing:
-        await safe_respond(ctx, "Nothing is playing right now.")
-        return
-    state = state_for(ctx.guild.id)  # type: ignore[union-attr]
-    state.elapsed_before_pause = elapsed_time(state)
-    state.paused_at = time.monotonic()
-    await voice.pause(True)
-    await refresh_panel(state, ctx.channel)
-    await safe_respond(ctx, "Paused.")
-
-
-@bot.hybrid_command(name="resume", description="Resume the paused song.")
-async def resume(ctx: commands.Context) -> None:
-    voice = ctx.guild.voice_client if ctx.guild else None
-    if not is_player(voice) or not voice.paused:
-        await safe_respond(ctx, "Nothing is paused right now.")
-        return
-    state = state_for(ctx.guild.id)  # type: ignore[union-attr]
-    state.started_at = time.monotonic()
-    state.paused_at = None
-    await voice.pause(False)
-    await refresh_panel(state, ctx.channel)
-    await safe_respond(ctx, "Back to the music.")
-
-
-@bot.hybrid_command(name="skip", description="Skip the current song.")
-async def skip(ctx: commands.Context) -> None:
-    voice = ctx.guild.voice_client if ctx.guild else None
-    if not is_player(voice) or not (voice.playing or voice.paused):
-        await safe_respond(ctx, "Nothing is playing right now.")
-        return
-    await voice.stop()
-    await safe_respond(ctx, "Skipped.")
-
-
-@bot.hybrid_command(name="stop", description="Stop playback and clear the queue.")
-async def stop(ctx: commands.Context) -> None:
-    if not ctx.guild:
-        await safe_respond(ctx, "Use this command inside a server.")
-        return
-    state = state_for(ctx.guild.id)
-    state.queue.clear()
-    voice = ctx.guild.voice_client
-    if is_player(voice) and (voice.playing or voice.paused):
-        state.suppress_after = True
-        await voice.stop()
-    else:
-        state.current = None
-        state.suppress_after = False
-    state.started_at = None
-    state.elapsed_before_pause = 0.0
-    state.paused_at = None
-    await refresh_panel(state, ctx.channel)
-    await safe_respond(ctx, "Stopped and cleared the queue.")
-
-
-@bot.hybrid_command(name="shuffle", description="Shuffle the waiting songs.")
-async def shuffle(ctx: commands.Context) -> None:
-    if not ctx.guild:
-        await safe_respond(ctx, "Use this command inside a server.")
-        return
-    state = state_for(ctx.guild.id)
-    tracks = list(state.queue)
-    random.shuffle(tracks)
-    state.queue = deque(tracks)
-    await refresh_panel(state, ctx.channel)
-    await safe_respond(ctx, "Queue shuffled.")
-
-
-@bot.hybrid_command(
-    name="queue",
-    aliases=["q"],
-    description="Show the current song and waiting queue.",
-)
-async def queue(ctx: commands.Context) -> None:
-    if not ctx.guild:
-        await safe_respond(ctx, "Use this command inside a server.")
-        return
-    await safe_respond(ctx, embed=queue_embed(state_for(ctx.guild.id)))
-
-
-@bot.hybrid_command(name="remove", aliases=["rm"], description="Remove a queued song by position.")
-@app_commands.describe(position="The song's number in /queue, starting from 1")
-async def remove(ctx: commands.Context, position: int) -> None:
-    if not ctx.guild:
-        await safe_respond(ctx, "Use this command inside a server.")
-        return
-    state = state_for(ctx.guild.id)
-    if position < 1 or position > len(state.queue):
-        await safe_respond(ctx, f"Choose a position from 1 to {len(state.queue)}.")
-        return
-    tracks = list(state.queue)
-    removed = tracks.pop(position - 1)
-    state.queue = deque(tracks)
-    await refresh_panel(state, ctx.channel)
-    await safe_respond(
-        ctx,
-        f"Removed **{discord.utils.escape_markdown(removed.title)}**.",
-    )
-
-
-@bot.hybrid_command(
-    name="clear",
-    aliases=["clr"],
-    description="Clear waiting songs without stopping the current one.",
-)
-async def clear(ctx: commands.Context) -> None:
-    if not ctx.guild:
-        await safe_respond(ctx, "Use this command inside a server.")
-        return
-    state = state_for(ctx.guild.id)
-    state.queue.clear()
-    await refresh_panel(state, ctx.channel)
-    await safe_respond(ctx, "Queue cleared. The current song will keep playing.")
-
-
-@bot.hybrid_command(
-    name="previous",
-    aliases=["prev", "back"],
-    description="Play the previous song again.",
-)
-async def previous(ctx: commands.Context) -> None:
-    if not ctx.guild:
-        await safe_respond(ctx, "Use this command inside a server.")
-        return
-    state = state_for(ctx.guild.id)
-    voice = ctx.guild.voice_client
-    if not state.history:
-        await safe_respond(ctx, "There isn’t a previous song yet.")
-        return
-    if state.current:
-        state.queue.appendleft(state.current)
-    state.queue.appendleft(state.history.pop())
-    if is_player(voice) and (voice.playing or voice.paused):
-        state.suppress_after = True
-        await voice.stop()
-    else:
-        await start_next(ctx.guild.id)
-    await safe_respond(ctx, "Playing the previous song.")
-
-
-@bot.hybrid_command(
-    name="loop",
-    aliases=["repeat", "rep"],
-    description="Set repeat mode for the current server.",
-)
-@app_commands.choices(
-    mode=[
-        app_commands.Choice(name="Off", value="off"),
-        app_commands.Choice(name="Current track", value="track"),
-        app_commands.Choice(name="Queue", value="queue"),
-    ]
-)
-async def loop(ctx: commands.Context, mode: str | None = None) -> None:
-    if not ctx.guild:
-        await safe_respond(ctx, "Use this command inside a server.")
-        return
-    state = state_for(ctx.guild.id)
-    if mode is None:
-        await safe_respond(
-            ctx,
-            f"Repeat is **{state.loop_mode}**. Choose `off`, `track`, or `queue`.",
-        )
-        return
-    mode = mode.lower()
-    if mode not in {"off", "track", "queue"}:
-        await safe_respond(ctx, "Choose `off`, `track`, or `queue`.")
-        return
-    state.loop_mode = mode
-    await refresh_panel(state, ctx.channel)
-    await safe_respond(ctx, f"Repeat set to **{mode}**.")
-
-
-@bot.hybrid_command(name="bass", description="Set bass boost for the next song.")
-@app_commands.describe(enabled="True to boost bass, false to turn it off")
-async def bass(ctx: commands.Context, enabled: bool) -> None:
-    if not ctx.guild:
-        await safe_respond(ctx, "Use this command inside a server.")
-        return
-    state = state_for(ctx.guild.id)
-    state.bass = enabled
-    await refresh_panel(state, ctx.channel)
-    await safe_respond(
-        ctx,
-        f"Bass boost is {'on' if enabled else 'off'} for the next song.",
-    )
-
-
-@bot.hybrid_command(name="help", description="Show Isai's music commands.")
-async def help_command(ctx: commands.Context) -> None:
-    await safe_respond(ctx, embed=help_embed())
-
-
-# ---------------------------- Owner commands ----------------------------
-
-
-@bot.hybrid_command(name="say", description="Owner only: send a message in this channel.")
-@app_commands.describe(message="Text for Isai to send")
-async def say(ctx: commands.Context, *, message: str) -> None:
-    if not user_is_owner(ctx.author):
-        await safe_respond(ctx, "That command is only available to the bot owners.", ephemeral=True)
-        return
-    await safe_respond(
-        ctx,
-        message,
-        ephemeral=False,
-    )
-
-
-@bot.hybrid_command(name="dm", description="Owner only: send a direct message.")
-@app_commands.describe(user="The recipient", message="Text for Isai to send")
-async def dm(ctx: commands.Context, user: discord.User, *, message: str) -> None:
-    if not user_is_owner(ctx.author):
-        await safe_respond(ctx, "That command is only available to the bot owners.", ephemeral=True)
-        return
-    if user.bot:
-        await safe_respond(ctx, "I won’t send owner DMs to bot accounts.", ephemeral=True)
-        return
-    try:
-        await user.send(
-            message,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-        await safe_respond(
-            ctx,
-            f"Sent a DM to **{discord.utils.escape_markdown(user.name)}**.",
-            ephemeral=True,
-        )
-    except discord.Forbidden:
-        await safe_respond(ctx, "That user’s DMs are closed.", ephemeral=True)
-
-
-@bot.hybrid_command(name="status", description="Owner only: set the bot's status.")
-@app_commands.choices(
-    status=[
-        app_commands.Choice(name="Online", value="online"),
-        app_commands.Choice(name="Idle", value="idle"),
-        app_commands.Choice(name="Do Not Disturb", value="dnd"),
-    ]
-)
-async def status(ctx: commands.Context, status: str) -> None:
-    if not user_is_owner(ctx.author):
-        await safe_respond(ctx, "That command is only available to the bot owners.", ephemeral=True)
-        return
-    status_value = {
-        "online": discord.Status.online,
-        "idle": discord.Status.idle,
-        "dnd": discord.Status.dnd,
-    }.get(status.lower())
-    if status_value is None:
-        await safe_respond(ctx, "Choose `online`, `idle`, or `dnd`.", ephemeral=True)
-        return
-    await bot.change_presence(status=status_value)
-    await safe_respond(ctx, f"Bot status set to **{status.lower()}**.", ephemeral=True)
-
-
-@bot.hybrid_command(name="platform", description="Owner only: explain Discord bot platform limits.")
-async def platform(ctx: commands.Context) -> None:
-    if not user_is_owner(ctx.author):
-        await safe_respond(ctx, "That command is only available to the bot owners.", ephemeral=True)
-        return
-    await safe_respond(
-        ctx,
-        "Discord’s official bot API does not let a bot choose or spoof a VR, mobile, "
-        "or desktop client platform. No platform setting was changed.",
-        ephemeral=True,
-    )
-
-
-# ------------------------------ Bot events ------------------------------
-
-
-@bot.event
-async def on_wavelink_node_ready(payload: wavelink.NodeReadyEventPayload) -> None:
-    log.info("Connected to Lavalink node %s.", payload.node.identifier)
-
-
-@bot.event
-async def on_wavelink_node_disconnected(
-    payload: wavelink.NodeDisconnectedEventPayload,
-) -> None:
-    log.warning("Lavalink node %s disconnected; Wavelink will attempt to reconnect.", payload.node.identifier)
-
-
-@bot.event
-async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload) -> None:
-    player = payload.player
-    if not player:
-        return
-    state = state_for(player.guild.id)
-    ended = state.current
-
-    if state.suppress_after:
-        state.suppress_after = False
-    elif ended:
-        if payload.reason == "finished" and state.loop_mode == "track":
-            state.queue.appendleft(ended)
-        elif payload.reason == "finished" and state.loop_mode == "queue":
-            state.queue.append(ended)
-        else:
-            state.history.append(ended)
-
-    state.current = None
-    state.started_at = None
-    state.elapsed_before_pause = 0.0
-    state.paused_at = None
-    await start_next(player.guild.id)
-    await refresh_panel(state)
-
-
-@bot.event
-async def on_wavelink_track_exception(
-    payload: wavelink.TrackExceptionEventPayload,
-) -> None:
-    log.warning(
-        "Lavalink track exception for guild %s: %s",
-        payload.player.guild.id if payload.player else "unknown",
-        payload.exception,
-    )
-
-
-@bot.event
-async def on_ready() -> None:
-    log.info("Isai is ready as %s.", bot.user)
-    await bot.change_presence(
-        status=discord.Status.online,
-        activity=discord.Activity(
-            type=discord.ActivityType.listening,
-            name=f"{PREFIX}help • /help",
-        ),
-    )
-
-
-@bot.event
-async def on_command_error(
-    ctx: commands.Context,
-    error: commands.CommandError,
-) -> None:
-    await handle_command_error(ctx, error)
-
-
-@bot.event
-async def on_app_command_error(
-    interaction: discord.Interaction,
-    error: app_commands.AppCommandError,
-) -> None:
-    log.error("Slash command error: %s", error)
-    await respond_interaction(
-        interaction,
-        "Something went wrong while running that command.",
-    )
-
-
-async def main() -> None:
-    missing = []
-    if not TOKEN:
-        missing.append("TOKEN")
-    if not LAVALINK_PASSWORD:
-        missing.append("LAVALINK_PASSWORD")
-    if missing:
-        raise SystemExit(
-            "Add the required secret(s) before starting Isai: "
-            + ", ".join(missing)
-        )
-    async with bot:
-        await bot.start(TOKEN)
-
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        log.info("Isai stopped.")
+    .setFooter({ text: 'Handcrafted with warmth & aesthetic care ♡', iconURL: client.user.displayAvatarURL() });
+}
+
+// Log in
+client.login(process.env.TOKEN);
