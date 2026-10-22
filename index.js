@@ -54,7 +54,7 @@ const client = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.GuildVoiceStates,
     GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildMessageReactions // Required for reaction cancellation
+    GatewayIntentBits.GuildMessageReactions
   ],
   partials: [Partials.Message, Partials.Channel, Partials.Reaction]
 });
@@ -70,10 +70,10 @@ const nodes = [
   }
 ];
 
-// Poru Audio Engine (Default: YouTube)
+// Poru Audio Engine (Default: YouTube Music)
 client.poru = new Poru(client, nodes, {
   library: 'discord.js',
-  defaultPlatform: 'ytsearch'
+  defaultPlatform: 'ytmsearch'
 });
 
 // State & Panel Management
@@ -201,10 +201,8 @@ function buildPanelEmbed(player, track) {
   return embed;
 }
 
-// Custom Emojis Only (No Text Labels)
-function buildPanelButtons(player) {
-  const state = getState(player.guildId);
-
+// All Buttons Strictly Dark Grey
+function buildPanelButtons() {
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId('btn_prev')
@@ -213,7 +211,7 @@ function buildPanelButtons(player) {
     new ButtonBuilder()
       .setCustomId('btn_pause')
       .setEmoji(EMOJIS.PAUSE_PLAY)
-      .setStyle(player.isPaused ? ButtonStyle.Success : ButtonStyle.Primary),
+      .setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId('btn_skip')
       .setEmoji(EMOJIS.SKIP)
@@ -221,14 +219,14 @@ function buildPanelButtons(player) {
     new ButtonBuilder()
       .setCustomId('btn_stop')
       .setEmoji(EMOJIS.STOP)
-      .setStyle(ButtonStyle.Danger)
+      .setStyle(ButtonStyle.Secondary)
   );
 
   const row2 = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId('btn_loop')
       .setEmoji(EMOJIS.LOOP)
-      .setStyle(player.loop !== 'NONE' ? ButtonStyle.Primary : ButtonStyle.Secondary),
+      .setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId('btn_shuffle')
       .setEmoji(EMOJIS.SHUFFLE)
@@ -236,7 +234,7 @@ function buildPanelButtons(player) {
     new ButtonBuilder()
       .setCustomId('btn_bass')
       .setEmoji(EMOJIS.BASS)
-      .setStyle(state.bassboost ? ButtonStyle.Success : ButtonStyle.Secondary),
+      .setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId('btn_queue')
       .setEmoji(EMOJIS.QUEUE)
@@ -265,7 +263,7 @@ client.poru.on('trackStart', async (player, track) => {
 
   const panelMsg = await channel.send({
     embeds: [buildPanelEmbed(player, track)],
-    components: buildPanelButtons(player)
+    components: buildPanelButtons()
   }).catch(() => null);
 
   if (!panelMsg) return;
@@ -275,7 +273,7 @@ client.poru.on('trackStart', async (player, track) => {
     try {
       await panelMsg.edit({
         embeds: [buildPanelEmbed(player, track)],
-        components: buildPanelButtons(player)
+        components: buildPanelButtons()
       });
     } catch {
       clearInterval(interval);
@@ -307,10 +305,10 @@ client.poru.on('queueEnd', async (player) => {
 const slashCommands = [
   new SlashCommandBuilder()
     .setName('play')
-    .setDescription('Play a song from YouTube, Spotify, or direct audio link')
+    .setDescription('Play a song from YouTube Music, Spotify, or direct audio link')
     .addStringOption(opt =>
       opt.setName('query')
-        .setDescription('Song title, YouTube URL, or Spotify link')
+        .setDescription('Song title, YouTube Music URL, or Spotify link')
         .setRequired(true)
         .setAutocomplete(true)
     ),
@@ -368,18 +366,26 @@ const slashCommands = [
 ];
 
 // ==========================================
-// 💡 READY & INSTANT SLASH COMMAND SYNC
+// 💡 READY & CLEAN PURGE/REFRESH SYSTEM
 // ==========================================
 client.once(Events.ClientReady, async () => {
   client.poru.init(client);
   console.log(`[Isai] Logged in as ${client.user.tag} ♡`);
 
   try {
+    console.log('[Isai] 🧹 Purging old commands to prevent duplicates...');
+
+    // 1. Delete all per-server slash commands from every guild
     for (const guild of client.guilds.cache.values()) {
-      await guild.commands.set(slashCommands).catch(() => {});
+      await guild.commands.set([]).catch(() => {});
     }
-    await client.application.commands.set(slashCommands).catch(() => {});
-    console.log('[Isai] Slash commands synced instantly to all connected guilds! 🌸');
+
+    // 2. Clear out any outdated global commands
+    await client.application.commands.set([]).catch(() => {});
+
+    // 3. Register the clean, fresh command set globally (Single source of truth)
+    await client.application.commands.set(slashCommands);
+    console.log('[Isai] ✨ Fresh slash commands deployed with 0 duplicates!');
   } catch (err) {
     console.error('[Isai Command Sync Error]:', err);
   }
@@ -390,12 +396,8 @@ client.once(Events.ClientReady, async () => {
   });
 });
 
-client.on(Events.GuildCreate, async (guild) => {
-  await guild.commands.set(slashCommands).catch(() => {});
-});
-
 // ==========================================
-// 🔍 YOUTUBE AUTOCOMPLETE
+// 🔍 YOUTUBE MUSIC AUTOCOMPLETE
 // ==========================================
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isAutocomplete()) return;
@@ -407,7 +409,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     try {
-      const res = await client.poru.resolve({ query: focusedValue, source: 'ytsearch' });
+      const res = await client.poru.resolve({ query: focusedValue, source: 'ytmsearch' });
       if (!res || !res.tracks || res.tracks.length === 0) {
         return interaction.respond([]);
       }
@@ -415,7 +417,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const choices = res.tracks.slice(0, 7).map(track => {
         const title = track.info.title.length > 70 ? track.info.title.substring(0, 67) + '...' : track.info.title;
         return {
-          name: `▶ ${title} (${track.info.author})`.substring(0, 100),
+          name: `🎵 ${title} (${track.info.author})`.substring(0, 100),
           value: track.info.uri
         };
       });
@@ -458,7 +460,7 @@ async function executePlay(guild, member, channel, query, sendReply) {
   const isUrl = /^https?:\/\//i.test(query);
   const res = await client.poru.resolve({
     query: query,
-    source: isUrl ? undefined : 'ytsearch',
+    source: isUrl ? undefined : 'ytmsearch',
     requester: member.user
   });
 
@@ -506,11 +508,9 @@ async function executePlay(guild, member, channel, query, sendReply) {
 
       const queuedMsg = await sendReply({ embeds: [queueEmbed] });
 
-      // Automatically react with ❌ to allow easy cancellation
       if (queuedMsg) {
         await queuedMsg.react('❌').catch(() => {});
 
-        // Collector allows requester or owner to cancel within 2 minutes
         const filter = (reaction, user) =>
           reaction.emoji.name === '❌' && (user.id === member.id || isOwnerUser(user.id)) && !user.bot;
 
@@ -725,8 +725,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (commandName === 'loop') {
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('loop_off').setLabel('Off').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('loop_track').setLabel('Track').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('loop_queue').setLabel('Queue').setStyle(ButtonStyle.Success)
+      new ButtonBuilder().setCustomId('loop_track').setLabel('Track').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('loop_queue').setLabel('Queue').setStyle(ButtonStyle.Secondary)
     );
     const embed = new EmbedBuilder().setColor(THEME_COLOR).setTitle('🔁 Loop Control').setDescription('Choose repeat mode:');
     return interaction.reply({ embeds: [embed], components: [row] });
@@ -815,7 +815,7 @@ async function handleButtonInteraction(interaction) {
   } else if (panel?.msg && player.currentTrack) {
     panel.msg.edit({
       embeds: [buildPanelEmbed(player, player.currentTrack)],
-      components: buildPanelButtons(player)
+      components: buildPanelButtons()
     }).catch(() => {});
   }
 }
@@ -1026,10 +1026,10 @@ client.on(Events.MessageCreate, async (message) => {
   if (isMatch(['loop', 'repeat', 'repeate', 'rep', 'lp'])) {
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('loop_off').setLabel('Off').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('loop_track').setLabel('Track').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('loop_queue').setLabel('Queue').setStyle(ButtonStyle.Success)
+      new ButtonBuilder().setCustomId('loop_track').setLabel('Track').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('loop_queue').setLabel('Queue').setStyle(ButtonStyle.Secondary)
     );
-    const embed = new EmbedBuilder().setColor(THEME_COLOR).setTitle('🔁 Loop Control').setDescription('Select repeat mode:');
+    const embed = new EmbedBuilder().setColor(THEME_COLOR).setTitle('🔁 Loop Control').setDescription('Choose repeat mode:');
     return sendReply({ embeds: [embed], components: [row] });
   }
 
@@ -1054,7 +1054,7 @@ function buildHelpEmbed() {
       {
         name: '🎧 Playback Commands',
         value:
-          `\`${prefix}play\` • \`${prefix}p\` • \`/play\` ➔ Play YouTube, Spotify & URL\n` +
+          `\`${prefix}play\` • \`${prefix}p\` • \`/play\` ➔ Play YouTube Music, Spotify & URL\n` +
           `\`${prefix}pause\` • \`/pause\` ➔ Pause song\n` +
           `\`${prefix}resume\` • \`${prefix}r\` • \`/resume\` ➔ Resume song\n` +
           `\`${prefix}skip\` • \`${prefix}s\` • \`/skip\` ➔ Skip track\n` +
