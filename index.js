@@ -2,6 +2,7 @@ require('dotenv').config();
 const {
   Client,
   GatewayIntentBits,
+  Partials,
   EmbedBuilder,
   ActionRowBuilder,
   ButtonBuilder,
@@ -15,10 +16,10 @@ const { Poru } = require('poru');
 // ==========================================
 // 🛡️ ANTI-CRASH PROTECTION SYSTEM
 // ==========================================
-process.on('unhandledRejection', (reason, promise) => {
+process.on('unhandledRejection', (reason) => {
   console.error('[Anti-Crash] Unhandled Rejection:', reason);
 });
-process.on('uncaughtException', (err, origin) => {
+process.on('uncaughtException', (err) => {
   console.error('[Anti-Crash] Uncaught Exception:', err);
 });
 
@@ -26,16 +27,36 @@ process.on('uncaughtException', (err, origin) => {
 // 🌸 BOT CONFIGURATION & SETTINGS
 // ==========================================
 let prefix = 'i';
-const owner = ['1377967442172579843', '774224543531270144'];
 const THEME_COLOR = 0xf3c4db; // Aesthetic sakura blush
+
+// Parse owner IDs from .env
+const owner = process.env.OWNERS
+  ? process.env.OWNERS.split(',').map((id) => id.trim())
+  : ['1377967442172579843', '1247200258719617115'];
+
+const isOwnerUser = (id) => owner.includes(id);
+
+// Custom Emojis for Player Buttons
+const EMOJIS = {
+  PREVIOUS: '<:Previous:1562765089332011009>',
+  PAUSE_PLAY: '<:pause_play:1562765087046115408>',
+  STOP: '<:stop:1562765084592443462>',
+  SKIP: '<:skip:1562765082050564146>',
+  LOOP: '<:loop:1562765079470936064>',
+  SHUFFLE: '<:shuffle:1562765076942032956>',
+  BASS: '<:bass:1562765074458738758>',
+  QUEUE: '<:queue:1562765071912804362>'
+};
 
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.GuildVoiceStates,
-    GatewayIntentBits.MessageContent
-  ]
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMessageReactions // Required for reaction cancellation
+  ],
+  partials: [Partials.Message, Partials.Channel, Partials.Reaction]
 });
 
 // Lavalink Node Setup
@@ -55,7 +76,7 @@ client.poru = new Poru(client, nodes, {
   defaultPlatform: 'ytsearch'
 });
 
-// Safe guild-level storage
+// State & Panel Management
 const activePanels = new Map();
 const guildState = new Map();
 
@@ -64,6 +85,18 @@ function getState(guildId) {
     guildState.set(guildId, { bassboost: false, previousTrack: null });
   }
   return guildState.get(guildId);
+}
+
+// Cleanly delete old panel and clear ticker
+async function cleanupOldPanel(guildId) {
+  const existing = activePanels.get(guildId);
+  if (existing) {
+    if (existing.interval) clearInterval(existing.interval);
+    if (existing.msg) {
+      await existing.msg.delete().catch(() => {});
+    }
+    activePanels.delete(guildId);
+  }
 }
 
 // Format Milliseconds to MM:SS
@@ -84,24 +117,18 @@ function renderProgressBar(current, total, length = 12) {
   return '━'.repeat(passed) + '🔘' + '─'.repeat(Math.max(0, remaining - 1));
 }
 
-// ==========================================
-// 🖼️ REAL SONG THUMBNAIL RESOLVER
-// ==========================================
+// Extract real song thumbnail
 function getTrackThumbnail(track) {
   if (!track || !track.info) return null;
   const info = track.info;
 
-  // 1. Lavalink v4 artworkUrl (Spotify / SoundCloud / YouTube)
   if (info.artworkUrl && typeof info.artworkUrl === 'string' && info.artworkUrl.startsWith('http')) {
     return info.artworkUrl;
   }
-
-  // 2. Poru image field
   if (info.image && typeof info.image === 'string' && info.image.startsWith('http')) {
     return info.image;
   }
 
-  // 3. Extract YouTube Video ID from identifier or URL
   let ytId = null;
   if (info.identifier && info.identifier.length === 11) {
     ytId = info.identifier;
@@ -119,14 +146,14 @@ function getTrackThumbnail(track) {
 
 // Safe Stop Method for Poru
 function stopMusic(player, guildId) {
-  clearTicker(guildId);
+  cleanupOldPanel(guildId);
   if (!player) return;
   player.queue.clear();
   try {
     if (typeof player.stop === 'function') {
       player.stop();
     } else {
-      player.skip(); // Safely skips the track with an empty queue, ending playback cleanly
+      player.skip();
     }
   } catch (err) {
     console.error('[Isai Stop Error]:', err.message);
@@ -154,7 +181,6 @@ function buildPanelEmbed(player, track) {
     .setTitle(track.info.title.substring(0, 70))
     .setURL(track.info.uri)
     .setDescription(
-      `💽 **Title:** [${track.info.title}](${track.info.uri})\n` +
       `**Author:** \`${track.info.author}\`\n` +
       `**Requested By:** <@${track.info.requester?.id || track.info.requester}>\n` +
       `**Duration:** \`${formatTime(duration)}\`\n\n` +
@@ -175,42 +201,49 @@ function buildPanelEmbed(player, track) {
   return embed;
 }
 
+// Custom Emojis Only (No Text Labels)
 function buildPanelButtons(player) {
   const state = getState(player.guildId);
+
   const row1 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('btn_prev').setEmoji('⏮️').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId('btn_prev')
+      .setEmoji(EMOJIS.PREVIOUS)
+      .setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId('btn_pause')
-      .setEmoji(player.isPaused ? '▶️' : '⏸️')
+      .setEmoji(EMOJIS.PAUSE_PLAY)
       .setStyle(player.isPaused ? ButtonStyle.Success : ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId('btn_skip').setEmoji('⏭️').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('btn_stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger)
+    new ButtonBuilder()
+      .setCustomId('btn_skip')
+      .setEmoji(EMOJIS.SKIP)
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId('btn_stop')
+      .setEmoji(EMOJIS.STOP)
+      .setStyle(ButtonStyle.Danger)
   );
 
   const row2 = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId('btn_loop')
-      .setLabel('Loop')
-      .setEmoji('🔁')
+      .setEmoji(EMOJIS.LOOP)
       .setStyle(player.loop !== 'NONE' ? ButtonStyle.Primary : ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('btn_shuffle').setLabel('Shuffle').setEmoji('🔀').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId('btn_shuffle')
+      .setEmoji(EMOJIS.SHUFFLE)
+      .setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId('btn_bass')
-      .setLabel('Bass')
-      .setEmoji('🎧')
+      .setEmoji(EMOJIS.BASS)
       .setStyle(state.bassboost ? ButtonStyle.Success : ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('btn_queue').setLabel('Queue').setEmoji('📜').setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder()
+      .setCustomId('btn_queue')
+      .setEmoji(EMOJIS.QUEUE)
+      .setStyle(ButtonStyle.Secondary)
   );
 
   return [row1, row2];
-}
-
-function clearTicker(guildId) {
-  const existing = activePanels.get(guildId);
-  if (existing?.interval) {
-    clearInterval(existing.interval);
-    activePanels.delete(guildId);
-  }
 }
 
 // ==========================================
@@ -225,7 +258,7 @@ client.poru.on('nodeError', (node, error) => {
 });
 
 client.poru.on('trackStart', async (player, track) => {
-  clearTicker(player.guildId);
+  await cleanupOldPanel(player.guildId);
 
   const channel = client.channels.cache.get(player.textChannel);
   if (!channel) return;
@@ -237,7 +270,6 @@ client.poru.on('trackStart', async (player, track) => {
 
   if (!panelMsg) return;
 
-  // Real-time slider bar ticker (every 5 seconds)
   const interval = setInterval(async () => {
     if (!player.isPlaying || player.isPaused) return;
     try {
@@ -246,21 +278,21 @@ client.poru.on('trackStart', async (player, track) => {
         components: buildPanelButtons(player)
       });
     } catch {
-      clearTicker(player.guildId);
+      clearInterval(interval);
     }
   }, 5000);
 
   activePanels.set(player.guildId, { msg: panelMsg, interval });
 });
 
-client.poru.on('trackEnd', (player, track) => {
+client.poru.on('trackEnd', async (player, track) => {
   const state = getState(player.guildId);
   state.previousTrack = track;
-  clearTicker(player.guildId);
+  await cleanupOldPanel(player.guildId);
 });
 
-client.poru.on('queueEnd', (player) => {
-  clearTicker(player.guildId);
+client.poru.on('queueEnd', async (player) => {
+  await cleanupOldPanel(player.guildId);
   const channel = client.channels.cache.get(player.textChannel);
   if (channel) {
     channel.send({
@@ -305,6 +337,9 @@ const slashCommands = [
 
   // Owner Only Slash Commands
   new SlashCommandBuilder()
+    .setName('devhelp')
+    .setDescription('Developer commands overview (Owner Only)'),
+  new SlashCommandBuilder()
     .setName('say')
     .setDescription('Broadcast a message (Owner Only)')
     .addStringOption(opt => opt.setName('content').setDescription('Message content').setRequired(true)),
@@ -315,7 +350,7 @@ const slashCommands = [
     .addStringOption(opt => opt.setName('content').setDescription('Message text').setRequired(true)),
   new SlashCommandBuilder()
     .setName('status')
-    .setDescription('Update bot presence (Owner Only)')
+    .setDescription('Update bot presence status (Owner Only)')
     .addStringOption(opt =>
       opt.setName('type')
         .setDescription('online, idle, or dnd')
@@ -325,7 +360,11 @@ const slashCommands = [
           { name: 'Idle', value: 'idle' },
           { name: 'Do Not Disturb', value: 'dnd' }
         )
-    )
+    ),
+  new SlashCommandBuilder()
+    .setName('customstatus')
+    .setDescription('Set custom bubble text status (Owner Only)')
+    .addStringOption(opt => opt.setName('text').setDescription('Custom status text').setRequired(true))
 ];
 
 // ==========================================
@@ -457,11 +496,50 @@ async function executePlay(guild, member, channel, query, sendReply) {
       const cover = getTrackThumbnail(track);
       const queueEmbed = new EmbedBuilder()
         .setColor(THEME_COLOR)
-        .setDescription(`˗ˏˋ ☕ **Queued:** [${track.info.title}](${track.info.uri})\nPosition: **#${player.queue.length}** ˎˊ˗`);
+        .setDescription(
+          `˗ˏˋ ☕ **Queued:** [${track.info.title}](${track.info.uri})\n` +
+          `**Position:** \`#${player.queue.length}\` ˎˊ˗\n\n` +
+          `*React with ❌ below to cancel if you entered by mistake!*`
+        );
 
       if (cover) queueEmbed.setThumbnail(cover);
 
-      sendReply({ embeds: [queueEmbed] });
+      const queuedMsg = await sendReply({ embeds: [queueEmbed] });
+
+      // Automatically react with ❌ to allow easy cancellation
+      if (queuedMsg) {
+        await queuedMsg.react('❌').catch(() => {});
+
+        // Collector allows requester or owner to cancel within 2 minutes
+        const filter = (reaction, user) =>
+          reaction.emoji.name === '❌' && (user.id === member.id || isOwnerUser(user.id)) && !user.bot;
+
+        const collector = queuedMsg.createReactionCollector({ filter, max: 1, time: 120000 });
+
+        collector.on('collect', async () => {
+          const index = player.queue.findIndex(
+            (t) => (t.info.identifier && t.info.identifier === track.info.identifier) || t === track
+          );
+
+          if (index !== -1) {
+            player.queue.remove(index);
+            await queuedMsg.edit({
+              embeds: [
+                new EmbedBuilder()
+                  .setColor(THEME_COLOR)
+                  .setDescription(`˗ˏˋ 🗑️ **Cancelled:** Removed [${track.info.title}](${track.info.uri}) from the queue! ˎˊ˗`)
+              ]
+            }).catch(() => {});
+          }
+          await queuedMsg.reactions.removeAll().catch(() => {});
+        });
+
+        collector.on('end', async (collected) => {
+          if (collected.size === 0) {
+            await queuedMsg.reactions.removeAll().catch(() => {});
+          }
+        });
+      }
     }
   }
 
@@ -499,13 +577,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
   const { commandName, guild, member, channel, user } = interaction;
-  const isOwner = owner.includes(user.id);
+  const isOwner = isOwnerUser(user.id);
 
-  if (['say', 'dm', 'status'].includes(commandName) && !isOwner) {
+  if (['say', 'dm', 'status', 'customstatus', 'devhelp'].includes(commandName) && !isOwner) {
     return interaction.reply({ content: 'Nothing here.', ephemeral: true });
   }
 
   // Owner Commands
+  if (commandName === 'devhelp') {
+    return interaction.reply({ embeds: [buildDevHelpEmbed()], ephemeral: true });
+  }
+
   if (commandName === 'say') {
     const text = interaction.options.getString('content');
     await channel.send(text);
@@ -527,6 +609,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const statusType = interaction.options.getString('type');
     client.user.setPresence({ status: statusType });
     return interaction.reply({ content: `Status set to \`${statusType}\` ✨`, ephemeral: true });
+  }
+
+  if (commandName === 'customstatus') {
+    const statusText = interaction.options.getString('text');
+    client.user.setPresence({
+      activities: [{ name: 'Custom Status', state: statusText, type: ActivityType.Custom }]
+    });
+    return interaction.reply({ content: `Bubble status updated to: "${statusText}" 🫧`, ephemeral: true });
   }
 
   // Music Commands
@@ -555,7 +645,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
   if (commandName === 'disconnect') {
     if (!player) return interaction.reply({ content: 'Not connected to any voice channel.', ephemeral: true });
-    clearTicker(guild.id);
+    await cleanupOldPanel(guild.id);
     player.destroy();
     return interaction.reply({
       embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('Disconnected from the voice channel 🌸')]
@@ -719,19 +809,9 @@ async function handleButtonInteraction(interaction) {
       break;
   }
 
-  // Update panel status or disable buttons when stopped
   const panel = activePanels.get(guild.id);
   if (customId === 'btn_stop') {
-    if (panel?.msg) {
-      panel.msg.edit({
-        embeds: [
-          new EmbedBuilder()
-            .setColor(THEME_COLOR)
-            .setDescription('˗ˏˋ ⏹️ **Playback stopped and queue cleared.** ˎˊ˗')
-        ],
-        components: []
-      }).catch(() => {});
-    }
+    await cleanupOldPanel(guild.id);
   } else if (panel?.msg && player.currentTrack) {
     panel.msg.edit({
       embeds: [buildPanelEmbed(player, player.currentTrack)],
@@ -752,35 +832,63 @@ client.on(Events.MessageCreate, async (message) => {
   const cmd = args.shift()?.toLowerCase();
   if (!cmd) return;
 
-  const isOwner = owner.includes(message.author.id);
+  const isOwner = isOwnerUser(message.author.id);
   const isMatch = (aliases) => aliases.includes(cmd);
 
-  // --- OWNER PREFIX COMMANDS ---
-  if (isMatch(['say', 'dm', 'status'])) {
+  // --- DEVELOPER HELP COMMAND ---
+  if (cmd === 'dev' && args[0]?.toLowerCase() === 'help') {
     if (!isOwner) return;
+    await message.delete().catch(() => {});
+    return message.channel.send({ embeds: [buildDevHelpEmbed()] });
+  }
+
+  // --- OWNER PREFIX COMMANDS (Auto-Delete Trigger) ---
+  if (isMatch(['say', 'dm', 'status', 'customstatus', 'cstatus'])) {
+    if (!isOwner) return;
+
+    await message.delete().catch(() => {});
 
     if (cmd === 'say') {
       const content = args.join(' ');
       if (!content) return;
-      await message.delete().catch(() => {});
       return message.channel.send(content);
     }
 
     if (cmd === 'dm') {
       const targetUser = message.mentions.users.first() || await client.users.fetch(args[0]).catch(() => null);
-      const text = args.slice(1).join(' ');
+      const text = message.mentions.users.first() ? args.slice(1).join(' ') : args.slice(1).join(' ');
       if (!targetUser || !text) return;
-      return targetUser.send(text).then(() => message.react('💌')).catch(() => message.react('❌'));
+      return targetUser.send(text).catch(() => {});
     }
 
     if (cmd === 'status') {
       const statusType = args[0]?.toLowerCase();
       if (['online', 'idle', 'dnd'].includes(statusType)) {
         client.user.setPresence({ status: statusType });
-        return message.react('✨');
       }
       return;
     }
+
+    if (cmd === 'customstatus' || cmd === 'cstatus') {
+      const statusText = args.join(' ');
+      if (!statusText) return;
+      client.user.setPresence({
+        activities: [{ name: 'Custom Status', state: statusText, type: ActivityType.Custom }]
+      });
+      return;
+    }
+  }
+
+  // Handle "icustom status <content>" format
+  if (cmd === 'custom' && args[0]?.toLowerCase() === 'status') {
+    if (!isOwner) return;
+    await message.delete().catch(() => {});
+    const statusText = args.slice(1).join(' ');
+    if (!statusText) return;
+    client.user.setPresence({
+      activities: [{ name: 'Custom Status', state: statusText, type: ActivityType.Custom }]
+    });
+    return;
   }
 
   // --- MUSIC PREFIX & SHORT ALIAS COMMANDS ---
@@ -813,7 +921,7 @@ client.on(Events.MessageCreate, async (message) => {
   // Disconnect: idisconnect / idc / ileave / il
   if (isMatch(['disconnect', 'dc', 'leave', 'l'])) {
     if (!player) return sendReply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('🌸 I am not in any voice channel!')] });
-    clearTicker(message.guild.id);
+    await cleanupOldPanel(message.guild.id);
     player.destroy();
     return sendReply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('Disconnected from voice channel 🌸')] });
   }
@@ -925,14 +1033,14 @@ client.on(Events.MessageCreate, async (message) => {
     return sendReply({ embeds: [embed], components: [row] });
   }
 
-  // Help: ihelp / ih
+  // Help: ihelp / ih (Public Help - Dev commands excluded)
   if (isMatch(['help', 'h'])) {
     return sendReply({ embeds: [buildHelpEmbed()] });
   }
 });
 
 // ==========================================
-// 📖 AESTHETIC HELP MENU
+// 📖 AESTHETIC PUBLIC HELP MENU
 // ==========================================
 function buildHelpEmbed() {
   return new EmbedBuilder()
@@ -971,6 +1079,31 @@ function buildHelpEmbed() {
       }
     )
     .setFooter({ text: 'Handcrafted with warmth & aesthetic care ♡', iconURL: client.user.displayAvatarURL() });
+}
+
+// ==========================================
+// 🔒 DEVELOPER / OWNER HELP MENU (idev help)
+// ==========================================
+function buildDevHelpEmbed() {
+  return new EmbedBuilder()
+    .setColor(0x2b2d31)
+    .setAuthor({ name: 'Isai • Developer & Owner Controls', iconURL: client.user.displayAvatarURL() })
+    .setDescription('Exclusive controls strictly accessible by verified bot owners. Messages automatically delete upon execution.')
+    .addFields(
+      {
+        name: '💬 Messaging Controls',
+        value:
+          `\`${prefix}say <content>\` | \`/say <content>\`\n↳ Broadcasts a message in the current channel.\n\n` +
+          `\`${prefix}dm <@user/id> <content>\` | \`/dm <user> <content>\`\n↳ Sends a direct message to a target user.`
+      },
+      {
+        name: '🫧 Presence & Status Controls',
+        value:
+          `\`${prefix}status <online/idle/dnd>\` | \`/status <type>\`\n↳ Sets Discord online availability.\n\n` +
+          `\`${prefix}custom status <text>\` | \`/customstatus <text>\`\n↳ Updates the bot's custom bubble status message.`
+      }
+    )
+    .setFooter({ text: 'Confidential Developer Hub 🔐', iconURL: client.user.displayAvatarURL() });
 }
 
 // Log in
