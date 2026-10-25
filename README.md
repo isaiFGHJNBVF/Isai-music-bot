@@ -1,198 +1,172 @@
-# 🌸 Isai Music Bot
+<div align="center">
 
-> An aesthetic, lightweight Discord music bot powered by **Discord.js**, **Poru**, and **Lavalink**.
-
-Isai (இசை) is a music bot with slash commands, prefix commands, an interactive music player panel, queue management, loop controls, and bass boost.
-
-## ✨ Features
-
-- 🎵 Play music using song searches and supported media URLs
-- 🔎 YouTube search autocomplete for the `/play` command
-- 🎛️ Interactive player panel with pause/resume, skip, previous, stop, loop, shuffle, bass, and queue buttons
-- 📜 Queue viewing, shuffling, clearing, and track removal
-- 🔁 Repeat the current track or the entire queue
-- 🎧 Bass boost using Lavalink filters
-- 🖼️ Track thumbnails and a live progress display
-- ⚡ Slash commands and prefix commands
-- 🌸 Soft sakura-pink embeds and an aesthetic help menu
-- 🛡️ Basic process-level error logging
-
-## 🧰 Requirements
-
-- **Node.js 18 or newer**
-- A Discord bot application and bot token
-- A reachable **Lavalink v4-compatible server** with a source/plugin configuration that supports the media you want to play
-- The packages listed in `package.json`
-
-> **Note:** Poru connects to Lavalink for audio playback. Installing the npm packages alone does not provide a Lavalink server. Configure your own server or use a trusted provider. Media-source availability depends on the Lavalink plugins and server configuration.
-
-## 📦 Installation
-
-1. **Download or clone** this project and open a terminal in its folder.
-
-2. **Install dependencies:**
-
-   ```bash
-   npm install
-   ```
-
-3. **Create a `.env` file** in the project root:
-
-   ```env
-   TOKEN=your_discord_bot_token
-
-   LAVALINK_HOST=your_lavalink_host
-   LAVALINK_PORT=2333
-   LAVALINK_PASSWORD=your_lavalink_password
-   LAVALINK_SECURE=false
-   ```
-
-   Replace the example values with your actual bot and Lavalink credentials. Use `LAVALINK_SECURE=true` when your Lavalink connection requires TLS.
-
-   The code has fallback Lavalink connection values, but configuring your own valid server is recommended.
-
-4. **Configure your Discord bot:**
-   - In the Discord Developer Portal, create an application and add a bot.
-   - Copy the bot token into `TOKEN` in `.env`. Never share or commit this token.
-   - Enable **Message Content Intent** in the bot's privileged gateway intents if you want prefix commands to work.
-   - Invite the bot to your server with the permissions it needs, including viewing channels, sending messages, embedding links, using application commands, and connecting to and speaking in voice channels.
-
-5. **Start the bot:**
-
-   ```bash
-   npm start
-   ```
-
-   This runs `node index.js`.
-
-## ⚙️ Environment variables
-
-| Variable | Purpose |
-| --- | --- |
-| `TOKEN` | Discord bot token; required |
-| `LAVALINK_HOST` | Lavalink server hostname |
-| `LAVALINK_PORT` | Lavalink server port |
-| `LAVALINK_PASSWORD` | Lavalink authentication password |
-| `LAVALINK_SECURE` | Set to `true` to use a secure connection; otherwise use `false` |
-
-## 🎮 Commands
-
-The default prefix is **`i`**. For example, `iplay` or `i play` is not required—the command format is `iplay <song>`.
-
-### Music and playback
-
-| Slash command | Prefix command | Purpose |
-| --- | --- | --- |
-| `/play query:<song or URL>` | `iplay <song or URL>` or `ip <song or URL>` | Play a search result or URL |
-| `/pause` | `ipause` | Pause playback |
-| `/resume` | `iresume` or `ir` | Resume playback |
-| `/skip` | `iskip`, `is`, or `inext` | Skip the current track |
-| `/previous` | `iprevious`, `iprev`, or `iback` | Return to the previous track recorded in the session |
-| `/stop` | `istop` | Stop playback and clear the queue |
-| `/connect` | `iconnect`, `ic`, `ijoin`, or `ij` | Join your voice channel |
-| `/disconnect` | `idisconnect`, `idc`, `ileave`, or `il` | Leave the voice channel |
-
-### Queue and audio controls
-
-| Slash command | Prefix command | Purpose |
-| --- | --- | --- |
-| `/queue` | `iqueue` or `iq` | View the current track and queued tracks |
-| `/shuffle` | `ishuffle` or `ish` | Shuffle queued tracks |
-| `/clear` | `iclear`, `iclr`, or `iclean` | Clear the queue |
-| `/remove target:<number or title>` | `iremove <number or title>`, `irm`, or `idel` | Remove a queued track |
-| `/loop` | `iloop`, `irepeat`, `irep`, or `ilp` | Choose loop mode |
-| `/bass enabled:<true/false>` | `ibass <on/off>` or `ibb` | Toggle bass boost |
-
-### Help and owner commands
-
-| Slash command | Prefix command | Purpose |
-| --- | --- | --- |
-| `/help` | `ihelp` or `ih` | Show the help menu |
-| `/say content:<message>` | `isay <message>` | Send a message as the bot (owner only) |
-| `/dm target:<user> content:<message>` | `idm <user> <message>` | DM a user (owner only) |
-| `/status type:<online/idle/dnd>` | `istatus <online/idle/dnd>` | Change the bot's presence status (owner only) |
-
-Owner-only commands are restricted to the user IDs configured in `index.js`. Change the owner IDs in the source code if necessary.
-
-> Prefix commands require the Message Content Intent. Slash commands are registered by the bot when it becomes ready. Registration and visibility can take time, and the bot needs the appropriate application-command permissions.
-
-## 🎛️ Player panel
-
-When a track starts, Isai posts a music panel with track details, artwork when available, duration, progress, loop mode, bass status, and queue count.
-
-The panel buttons provide:
-
-- Previous track
-- Pause or resume
-- Skip
-- Stop and clear the queue
-- Cycle through loop modes
-- Shuffle the queue
-- Toggle bass boost
-- View upcoming tracks
-
-The progress display refreshes periodically while playback is active.
-
-## 📁 Project structure
-
-```text
-isai-music-bot/
-├── index.js
-├── package.json
-├── package-lock.json
-└── .env
+```ascii
+  ██╗ ███████╗ █████╗ ██╗
+  ██║ ██╔════╝██╔══██╗██║
+  ██║ ███████╗███████║██║
+  ██║ ╚════██║██╔══██║██║
+  ██║ ███████║██║  ██║██║
+  ╚═╝ ╚══════╝╚═╝  ╚═╝╚═╝
+         🌸 A E S T H E T I C   M U S I C   B O T 🌸
 ```
 
-- `index.js` — bot setup, commands, Lavalink/Poru events, and player controls
-- `package.json` — project metadata, scripts, and dependencies
-- `package-lock.json` — exact dependency versions installed by npm
-- `.env` — private bot and Lavalink configuration; do not commit this file
+# 🌸 Isai DISCORD MUSIC BOT
+### *High-Performance, Standalone Discord Audio Bot Powered by Lavalink v4 & Poru*
 
-## ☁️ Hosting
+[![Node.js](https://img.shields.io/badge/Node.js-v18%2B-339933?style=for-the-badge&logo=nodedotjs&logoColor=white)](https://nodejs.org/)
+[![Discord.js](https://img.shields.io/badge/Discord.js-v14.16.3-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.js.org/)
+[![Poru Engine](https://img.shields.io/badge/Poru-v5.3.0-FF69B4?style=for-the-badge&logo=jam&logoColor=white)](https://github.com/parasop/poru)
+[![Lavalink v4](https://img.shields.io/badge/Lavalink-v4.x%20Ready-7C3AED?style=for-the-badge&logo=spring&logoColor=white)](https://github.com/sridharanry-star/lavalink)
+[![License](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)](LICENSE)
 
-On a Node.js hosting platform:
+<br/>
 
-1. Upload the project files.
-2. Select **Node.js 18 or newer**.
-3. Install dependencies using `npm install` (or the host's dependency installation step).
-4. Add the environment variables from the table above in the host's environment-variable settings.
-5. Ensure the Lavalink server is reachable from the bot host.
-6. Set the startup command to:
-
-   ```bash
-   npm start
-   ```
-
-Keep the process running and check the logs for Discord login and Lavalink connection messages.
-
-## 🛠️ Troubleshooting
-
-- **Bot does not log in:** Check that `TOKEN` is correct and that the token has not been reset.
-- **Prefix commands do not work:** Enable Message Content Intent in the Developer Portal and ensure `TOKEN` is set correctly.
-- **Slash commands do not appear:** Check the bot's application-command permissions, invite scopes, and startup logs. Allow time for command registration to propagate.
-- **Bot joins voice but music does not play:** Verify the Lavalink host, port, password, TLS setting, and server availability.
-- **Search returns no tracks or loading fails:** Check Lavalink source/plugin configuration and server logs. Not every source or URL is supported by every Lavalink setup.
-- **Bot cannot join or speak:** Check its channel permissions and confirm that the user issuing the command is in a voice channel.
-- **Bass boost has no effect:** Confirm that the Lavalink server and audio filters support equalizer filters.
-
-## 🔐 Security
-
-- Never publish your Discord bot token or Lavalink password.
-- Keep `.env` out of public repositories. Add it to `.gitignore`.
-- If a token or password is exposed, rotate it immediately.
-- Owner-only commands depend on the owner IDs configured in `index.js`.
-
-Suggested `.gitignore`:
-
-```gitignore
-node_modules/
-.env
-```
-
-## 📄 License
-
-No license is specified in the provided project configuration. Add a `LICENSE` file if you intend to publish the project and want to define how others may use, modify, or redistribute it.
+<p align="center">
+  <b>Isai</b> is an ultra-sleek, feature-packed Discord music bot crafted with a beautiful <b>Neon Pink Sakura</b> aesthetic. Engineered for 24/7 reliability, zero downtime with multi-node Lavalink failover, responsive interactive button controls, and crystal-clear audio fidelity.
+</p>
 
 ---
 
-Made with ♡ by **Isai** 🌸
+[✨ Features](#-key-features) •
+[🚀 Quick Start](#-quick-start) •
+[⚙️ Configuration](#️-configuration) •
+[🎵 Commands](#-commands--controls) •
+[🛡️ Architecture](#️-anti-crash--failover-architecture)
+
+---
+
+</div>
+
+<br/>
+
+## ✨ Key Features
+
+- 🌸 **Sakura Blush Visuals**: Gorgeous custom player embed UI with rich metadata, duration bars, and high-res album covers.
+- 🎛️ **Interactive Button Controls**: Real-time media controls (`Previous`, `Play/Pause`, `Stop`, `Skip`, `Loop`, `Shuffle`, `Bass Boost`, `Queue`).
+- ⚡ **Multi-Node Failover**: Supports multi-node arrays with automatic dead-socket recovery, auto-healing, and seamless fallback.
+- 🕒 **24/7 Voice Mode**: Keep the bot active in your voice channel permanently without timing out.
+- 👑 **Owner Privilege System**: Configurable owner IDs with prefixless quick-command access (`p`, `s`, `dc`, etc.).
+- 🛡️ **Anti-Crash Guard**: Bulletproof unhandled rejection and uncaught exception handlers keep the bot online continuously.
+- 🌐 **Multi-Platform Audio**: Supports YouTube Music, Spotify, JioSaavn, SoundCloud, Deezer, and direct audio streams via Lavalink.
+
+<br/>
+
+---
+
+## 🚀 Quick Start
+
+### 1. Prerequisites
+- **Node.js 18.0.0 or higher**: [Download Node.js](https://nodejs.org/)
+- A **Discord Bot Token**: [Discord Developer Portal](https://discord.com/developers/applications)
+- A running **Lavalink v4 Node**: [Ryuga Lavalink Server](https://github.com/sridharanry-star/lavalink)
+
+### 2. Installation
+Clone or extract the project:
+```bash
+git clone https://github.com/isaiFGHJNBVF/Isai-music-bot.git
+cd Isai-music-bot
+npm install
+```
+
+### 3. Configure `.env`
+Copy the template and fill in your credentials:
+```bash
+cp .env.example .env
+```
+Open `.env` and set your `TOKEN` and Lavalink connection details.
+
+### 4. Run the Bot
+#### 🪟 Windows
+Double-click `start.bat` or run:
+```bat
+start.bat
+```
+
+#### 🐧 Linux / macOS
+```bash
+chmod +x start.sh
+./start.sh
+```
+
+#### ⌨️ Manual Command
+```bash
+npm start
+```
+
+<br/>
+
+---
+
+## ⚙️ Configuration (`.env`)
+
+| Variable | Description | Default / Example |
+| :--- | :--- | :--- |
+| `TOKEN` | Discord Bot Application Token *(Required)* | `MTUxMzA...` |
+| `OWNERS` | Comma-separated Discord User IDs for owner privileges | `1377967442172579843,1247200258719617115` |
+| `SPOTIFY_CLIENT_ID` | Spotify API client ID *(Optional)* | `9f951e...` |
+| `SPOTIFY_CLIENT_SECRET` | Spotify API client secret *(Optional)* | `e0c83c...` |
+| `LAVALINK_HOST` | Primary Lavalink server host | `193.226.78.187` |
+| `LAVALINK_PORT` | Lavalink server port | `4998` |
+| `LAVALINK_PASSWORD` | Lavalink server password | `ryugalavalink` |
+| `LAVALINK_SECURE` | Use SSL (`true` for https/wss, `false` for http/ws) | `false` |
+| `LAVALINK_NODES` | JSON array of fallback nodes for automatic failover | `[{"name":"Node1", ...}]` |
+
+<br/>
+
+---
+
+## 🎵 Commands & Controls
+
+Default Prefix: `i` *(customizable via `i prefix <new_prefix>`)*
+
+### 🎧 Music Playback
+| Command | Aliases | Description |
+| :--- | :--- | :--- |
+| `play <query/url>` | `p` | Play a song or playlist from YouTube, Spotify, etc. |
+| `pause` | - | Pause the current track |
+| `resume` | `r` | Resume playback |
+| `skip` | `s`, `next` | Skip to the next track in queue |
+| `previous` | `prev`, `back` | Play the previous track |
+| `stop` | `dc`, `leave` | Stop playback and disconnect from voice |
+| `queue` | `q` | Display upcoming songs in queue |
+| `clear` | `clr`, `clean` | Clear all tracks from queue |
+| `shuffle` | `sh` | Shuffle songs in queue |
+| `loop` | `repeat`, `lp` | Toggle track / queue loop mode |
+| `bass` | `bb` | Toggle bass boost audio filter |
+
+### ⚙️ Utilities & Admin
+| Command | Description |
+| :--- | :--- |
+| `247` / `stay` | Toggle 24/7 stay mode in the current voice channel |
+| `prefix <prefix>` | Change the server's command prefix |
+| `status <text>` | Set bot custom status (Owner only) |
+| `say <message>` | Send a message through the bot (Owner only) |
+
+<br/>
+
+---
+
+## 🛡️ Anti-Crash & Failover Architecture
+
+```mermaid
+flowchart TD
+    User([User in Discord]) -->|Slash / Text Command| DJS[Discord.js Client Gateway]
+    DJS --> Poru[Poru Audio Dispatcher]
+    
+    subgraph Failover System
+        Poru -->|Active Connection| Node1[Lavalink Core Node 1]
+        Node1 -.->|Socket Drop / Timeout| Supervisor[Node Supervisor Monitor]
+        Supervisor -->|Automatic Hot Swap| Node2[Fallback Lavalink Node 2]
+        Supervisor -->|Background Re-connect| Node1
+    end
+    
+    Node1 --> DiscordVoice[Discord Voice Server / UDP]
+    Node2 --> DiscordVoice
+```
+
+<br/>
+
+---
+
+## 📜 License
+Distributed under the **MIT License**. Created with 💖 for high-performance Discord music streaming.
