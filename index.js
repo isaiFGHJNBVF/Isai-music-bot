@@ -9,9 +9,30 @@ const {
   ButtonStyle,
   SlashCommandBuilder,
   ActivityType,
-  Events
+  Events,
+  MessageFlags
 } = require('discord.js');
-const { Poru } = require('poru');
+const { Poru, Rest } = require('poru');
+
+// Lavalink REST content-type patch:
+// Some Lavalink nodes return 'application/json;charset=utf-8' which fails Poru's
+// strict `=== "application/json"` check, causing Rest.get to return a raw string
+// and throwing "Cannot create property 'loadType' on string".
+if (Rest && Rest.prototype && Rest.prototype.get) {
+  const origRestGet = Rest.prototype.get;
+  Rest.prototype.get = async function (path) {
+    const res = await origRestGet.call(this, path);
+    if (typeof res === 'string') {
+      try {
+        return JSON.parse(res);
+      } catch {
+        // Upstream returned an HTML error page (e.g. Cloudflare 502/524)
+        return { loadType: 'error', data: { message: 'Upstream server error' } };
+      }
+    }
+    return res;
+  };
+}
 
 // ==========================================
 // 🛡️ ANTI-CRASH PROTECTION SYSTEM
@@ -26,7 +47,34 @@ process.on('uncaughtException', (err) => {
 // ==========================================
 // 🌸 BOT CONFIGURATION & SETTINGS
 // ==========================================
-let prefix = 'i';
+const fs = require('fs');
+const path = require('path');
+
+const SETTINGS_FILE = path.join(__dirname, 'settings.json');
+
+function loadSettings() {
+  try {
+    const data = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
+    return {
+      prefix: typeof data.prefix === 'string' && data.prefix.trim() ? data.prefix : 'i',
+      stay247: data.stay247 && typeof data.stay247 === 'object' ? data.stay247 : {}
+    };
+  } catch {
+    return { prefix: 'i', stay247: {} };
+  }
+}
+
+const settings = loadSettings();
+
+function saveSettings() {
+  try {
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2));
+  } catch (err) {
+    console.log('[isai Settings Error]', err.message);
+  }
+}
+
+let prefix = settings.prefix;
 const THEME_COLOR = 0xf3c4db; // Aesthetic sakura blush
 
 // Parse owner IDs from .env
@@ -35,6 +83,16 @@ const owner = process.env.OWNERS
   : ['1377967442172579843', '1247200258719617115'];
 
 const isOwnerUser = (id) => owner.includes(id);
+
+// Commands owners may use without the prefix (no-prefix is an owner privilege).
+const NO_PREFIX_ALIASES = new Set([
+  'play', 'p', 'connect', 'c', 'join', 'j', 'disconnect', 'dc', 'leave', 'l',
+  'pause', 'resume', 'r', 'skip', 's', 'next', 'previous', 'prev', 'back', 'stop',
+  'queue', 'q', 'clear', 'clr', 'clean', 'remove', 'rm', 'del', 'shuffle', 'sh',
+  'bass', 'bb', 'loop', 'repeat', 'repeate', 'rep', 'lp', 'help', 'h',
+  '247', '24/7', 'stay', 'prefix', 'setprefix',
+  'say', 'dm', 'status', 'customstatus', 'cstatus', 'custom', 'dev'
+]);
 
 // Custom Emojis for Player Buttons
 const EMOJIS = {
@@ -59,22 +117,221 @@ const client = new Client({
   partials: [Partials.Message, Partials.Channel, Partials.Reaction]
 });
 
-// Lavalink Node Setup
-const nodes = [
-  {
-    name: 'Isai-Core',
-    host: process.env.LAVALINK_HOST || 'lavalink.jirayu.net',
-    port: parseInt(process.env.LAVALINK_PORT || '13592', 10),
+// Without these listeners a single gateway error would crash the whole process.
+client.on(Events.Error, (err) => console.error('[isai Discord Error]', err?.message || err));
+client.on(Events.Warn, (msg) => console.warn('[isai Discord Warn]', msg));
+
+// Lavalink Node Setup (supports multiple fallback nodes)
+// Option A: LAVALINK_NODES='[{"name":"A","host":"x.com","port":443,"password":"pw","secure":true}]'
+// Option B: single node via LAVALINK_HOST / PORT / PASSWORD / SECURE
+let nodes;
+try {
+  nodes = process.env.LAVALINK_NODES ? JSON.parse(process.env.LAVALINK_NODES) : null;
+} catch (e) {
+  console.log('[isai] LAVALINK_NODES is not valid JSON, falling back to single node.');
+}
+if (!Array.isArray(nodes) || !nodes.length) {
+  nodes = [{
+    name: 'isai-Core',
+    host: process.env.LAVALINK_HOST,
+    port: parseInt(process.env.LAVALINK_PORT || '2333', 10),
     password: process.env.LAVALINK_PASSWORD || 'youshallnotpass',
     secure: process.env.LAVALINK_SECURE === 'true'
-  }
-];
+  }];
+}
+
+console.log(`[isai Audio] Configured nodes: ${nodes.map((n) => `${n.name} (${n.host}:${n.port})`).join(', ')}`);
 
 // Poru Audio Engine (Default: YouTube Music)
 client.poru = new Poru(client, nodes, {
   library: 'discord.js',
-  defaultPlatform: 'ytmsearch'
+  defaultPlatform: 'ytmsearch',
+  reconnectTimeout: 10000,
+  reconnectTries: 100
 });
+
+// True when at least one Lavalink node is connected
+const hasNode = () => client.poru.leastUsedNodes.length > 0;
+const NO_NODE_EMBED = () => new EmbedBuilder()
+  .setColor(THEME_COLOR)
+  .setDescription('⚠️ **The music server is offline right now. Please try again in a bit!**');
+
+// ==========================================
+// 🛰️ LAVALINK NODE SUPERVISION
+// ==========================================
+// Poru removes a node from its internal list the moment its socket closes, and
+// its built-in reconnect gives up after `reconnectTries`. Free/public nodes drop
+// sockets on purpose (idle timeout, restarts, session limits), which used to
+// leave the bot with zero nodes forever -> every command answered
+// "music server is offline". This re-creates the node whenever it disappears.
+const nodeConfigs = nodes;
+let nodeRecoveryInFlight = false;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function waitForNode(timeoutMs = 0) {
+  const deadline = Date.now() + timeoutMs;
+  while (!hasNode()) {
+    if (Date.now() >= deadline) return null;
+    await sleep(250);
+  }
+  return client.poru.leastUsedNodes[0];
+}
+
+async function restoreNodes() {
+  if (hasNode() || nodeRecoveryInFlight) return null;
+  nodeRecoveryInFlight = true;
+  try {
+    for (const config of nodeConfigs) {
+      const existing = client.poru.nodes.get(config.name);
+      try {
+        if (existing) {
+          // Cancel Poru's pending reconnect so two sockets never open at once.
+          if (existing.reconnectAttempt) {
+            clearTimeout(existing.reconnectAttempt);
+            existing.reconnectAttempt = null;
+          }
+          // Drop the dead socket first: its close handler would otherwise remove
+          // the node we are about to re-add under the same name. Aborting a socket
+          // that is still connecting emits "error"/"close" on it, so keep no-op
+          // listeners attached or Node turns that into an uncaught exception.
+          if (existing.ws) {
+            const stale = existing.ws;
+            existing.ws = null;
+            stale.removeAllListeners();
+            stale.on('error', () => {});
+            stale.on('close', () => {});
+            try { stale.terminate(); } catch { /* already closed */ }
+          }
+          existing.isConnected = false;
+          existing.attempt = 0;
+          await existing.connect();
+        } else {
+          await client.poru.addNode(config);
+        }
+      } catch (err) {
+        console.log(`[isai Audio Error] Could not (re)connect ${config.name}:`, err.message);
+        continue;
+      }
+
+      if (await waitForNode(5000)) {
+        console.log(`[isai Audio] Node ${config.name} recovered ♡`);
+        return client.poru.leastUsedNodes[0];
+      }
+    }
+    console.log('[isai Audio] Still no Lavalink node available, retrying soon.');
+    return null;
+  } finally {
+    nodeRecoveryInFlight = false;
+  }
+}
+
+// Used by music commands: wait a few seconds for the node to come back instead
+// of instantly answering "offline" while it is reconnecting.
+async function getMusicNode(waitMs = 8000) {
+  if (hasNode()) return client.poru.leastUsedNodes[0];
+  restoreNodes().catch((err) => console.log('[isai Audio Error] Node recovery failed:', err.message));
+  return waitForNode(waitMs);
+}
+
+// ==========================================
+// 🔁 24/7 VOICE MODE
+// ==========================================
+// Enabled guilds are stored in settings.json so the bot rejoins their voice
+// channel after a restart or a kick, and never leaves when the queue ends.
+async function setStay247(guild, voiceChannel, textChannel, enable) {
+  if (!enable) {
+    delete settings.stay247[guild.id];
+    saveSettings();
+    return { ok: true, enabled: false };
+  }
+
+  if (!voiceChannel) return { ok: false, reason: 'voice' };
+  if (!(await getMusicNode())) return { ok: false, reason: 'node' };
+
+  settings.stay247[guild.id] = { voiceChannel: voiceChannel.id, textChannel: textChannel.id };
+  saveSettings();
+
+  const player = client.poru.players.get(guild.id);
+  if (player) {
+    if (player.voiceChannel !== voiceChannel.id) {
+      player.voiceChannel = voiceChannel.id;
+      player.connect();
+    }
+  } else {
+    client.poru.createConnection({
+      guildId: guild.id,
+      voiceChannel: voiceChannel.id,
+      textChannel: textChannel.id,
+      deaf: true
+    });
+  }
+
+  return { ok: true, enabled: true };
+}
+
+async function rejoinStay(guildId) {
+  const saved = settings.stay247[guildId];
+  const guild = client.guilds.cache.get(guildId);
+  if (!saved || !guild) return;
+  if (!(await getMusicNode())) return;
+
+  const player = client.poru.players.get(guildId);
+  if (player) {
+    player.voiceChannel = saved.voiceChannel;
+    player.textChannel = saved.textChannel;
+    player.connect();
+    return;
+  }
+
+  client.poru.createConnection({
+    guildId,
+    voiceChannel: saved.voiceChannel,
+    textChannel: saved.textChannel,
+    deaf: true
+  });
+  console.log(`[isai 24/7] Rejoined ${guild.name}.`);
+}
+
+async function restoreStayGuilds() {
+  const entries = Object.entries(settings.stay247);
+  if (!entries.length) return;
+
+  if (!(await waitForNode(30000))) {
+    console.log('[isai 24/7] No Lavalink node yet, will rejoin on the next command.');
+    return;
+  }
+
+  for (const [guildId, saved] of entries) {
+    const guild = client.guilds.cache.get(guildId);
+    if (!guild || !saved?.voiceChannel) continue;
+
+    if (!guild.channels.cache.get(saved.voiceChannel)) {
+      delete settings.stay247[guildId];
+      saveSettings();
+      continue;
+    }
+
+    try {
+      const player = client.poru.players.get(guildId);
+      if (player) {
+        player.voiceChannel = saved.voiceChannel;
+        player.textChannel = saved.textChannel;
+        player.connect();
+      } else {
+        client.poru.createConnection({
+          guildId,
+          voiceChannel: saved.voiceChannel,
+          textChannel: saved.textChannel,
+          deaf: true
+        });
+      }
+      console.log(`[isai 24/7] Rejoined ${guild.name}.`);
+    } catch (err) {
+      console.log('[isai 24/7 Error]', err?.message || err);
+    }
+  }
+}
 
 // State & Panel Management
 const activePanels = new Map();
@@ -144,6 +401,11 @@ function getTrackThumbnail(track) {
   return null;
 }
 
+// Fire-and-forget wrapper for Poru calls that reject when a node drops.
+const safe = (promise) => Promise.resolve(promise).catch((err) => {
+  console.log('[isai Audio Error]', err?.message || err);
+});
+
 // Safe Stop Method for Poru
 function stopMusic(player, guildId) {
   cleanupOldPanel(guildId);
@@ -153,10 +415,10 @@ function stopMusic(player, guildId) {
     if (typeof player.stop === 'function') {
       player.stop();
     } else {
-      player.skip();
+      safe(player.skip());
     }
   } catch (err) {
-    console.error('[Isai Stop Error]:', err.message);
+    console.error('[isai Stop Error]:', err.message);
   }
 }
 
@@ -191,7 +453,7 @@ function buildPanelEmbed(player, track) {
       { name: '୨ৎ Bass', value: `\`${isBass}\``, inline: true },
       { name: '୨ৎ In Queue', value: `\`${player.queue.length} track(s)\``, inline: true }
     )
-    .setFooter({ text: 'Isai • Pure aesthetic vibes ♡', iconURL: client.user.displayAvatarURL() });
+    .setFooter({ text: 'isai • Pure aesthetic vibes ♡', iconURL: client.user.displayAvatarURL() });
 
   const songCover = getTrackThumbnail(track);
   if (songCover) {
@@ -248,11 +510,32 @@ function buildPanelButtons() {
 // 🎵 PORU (LAVALINK) EVENTS
 // ==========================================
 client.poru.on('nodeConnect', (node) => {
-  console.log(`[Isai Audio] Connected to Lavalink Node: ${node.name} ✨`);
+  node.attempt = 0;
+  console.log(`[isai Audio] Connected to Lavalink Node: ${node.name} ✨`);
+
+  // A reconnect starts a fresh Lavalink session: re-send voice state so that
+  // players created before the drop can still play afterwards.
+  for (const player of client.poru.players.values()) {
+    if (player.node === node) player.connect();
+  }
+});
+
+client.poru.on('nodeDisconnect', (node, code) => {
+  if (!code) return; // Poru emits this twice per drop; only the one with a close code matters
+  console.log(`[isai Audio] Lost connection to ${node.name} (code ${code}).`);
+});
+
+client.poru.on('nodeReconnect', (node) => {
+  console.log(`[isai Audio] Reconnecting to ${node.name}...`);
 });
 
 client.poru.on('nodeError', (node, error) => {
-  console.log(`[Isai Audio Error] ${node.name}:`, error.message);
+  console.log(`[isai Audio Error] ${node.name}:`, error?.code || error?.message || error);
+});
+
+// Set LAVALINK_DEBUG=true in .env to see raw Poru websocket details.
+client.poru.on('debug', (...args) => {
+  if (process.env.LAVALINK_DEBUG === 'true') console.log('[Poru Debug]', ...args);
 });
 
 client.poru.on('trackStart', async (player, track) => {
@@ -331,7 +614,19 @@ const slashCommands = [
     .setDescription('Toggle high-quality bass boost')
     .addBooleanOption(opt => opt.setName('enabled').setDescription('Enable or disable bass boost').setRequired(true)),
   new SlashCommandBuilder().setName('loop').setDescription('Change repeat/loop modes'),
-  new SlashCommandBuilder().setName('help').setDescription('Aesthetic overview of all Isai commands'),
+  new SlashCommandBuilder().setName('help').setDescription('Aesthetic overview of all isai commands'),
+  new SlashCommandBuilder().setName('ping').setDescription('Check bot latency and music server status'),
+  new SlashCommandBuilder()
+    .setName('24-7')
+    .setDescription('Keep isai in your voice channel 24/7 (survives restarts)'),
+  new SlashCommandBuilder()
+    .setName('prefix')
+    .setDescription('Change the command prefix (Owner Only)')
+    .addStringOption(opt =>
+      opt.setName('new_prefix')
+        .setDescription('New prefix (1-5 characters, no spaces)')
+        .setRequired(true)
+    ),
 
   // Owner Only Slash Commands
   new SlashCommandBuilder()
@@ -370,10 +665,20 @@ const slashCommands = [
 // ==========================================
 client.once(Events.ClientReady, async () => {
   client.poru.init(client);
-  console.log(`[Isai] Logged in as ${client.user.tag} ♡`);
+  console.log(`[isai] Logged in as ${client.user.tag} ♡`);
+
+  // Rejoin voice channels of guilds with 24/7 mode enabled.
+  restoreStayGuilds().catch((err) => console.log('[isai 24/7 Error]', err?.message || err));
+
+  // Self-healing watchdog: rebuild the Lavalink node if it ever drops out.
+  setInterval(() => {
+    if (hasNode()) return;
+    console.log('[isai Audio] No Lavalink node connected, attempting recovery...');
+    restoreNodes().catch((err) => console.log('[isai Audio Error] Node recovery failed:', err.message));
+  }, 15000);
 
   try {
-    console.log('[Isai] 🧹 Purging old commands to prevent duplicates...');
+    console.log('[isai] 🧹 Purging old commands to prevent duplicates...');
 
     // 1. Delete all per-server slash commands from every guild
     for (const guild of client.guilds.cache.values()) {
@@ -385,9 +690,9 @@ client.once(Events.ClientReady, async () => {
 
     // 3. Register the clean, fresh command set globally (Single source of truth)
     await client.application.commands.set(slashCommands);
-    console.log('[Isai] ✨ Fresh slash commands deployed with 0 duplicates!');
+    console.log('[isai] ✨ Fresh slash commands deployed with 0 duplicates!');
   } catch (err) {
-    console.error('[Isai Command Sync Error]:', err);
+    console.error('[isai Command Sync Error]:', err);
   }
 
   client.user.setPresence({
@@ -404,8 +709,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
   if (interaction.commandName === 'play') {
     const focusedValue = interaction.options.getFocused();
-    if (!focusedValue || focusedValue.trim().length === 0) {
-      return interaction.respond([]);
+    if (!focusedValue || focusedValue.trim().length === 0 || !hasNode()) {
+      return interaction.respond([]).catch(() => {});
     }
 
     try {
@@ -418,7 +723,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const title = track.info.title.length > 70 ? track.info.title.substring(0, 67) + '...' : track.info.title;
         return {
           name: `🎵 ${title} (${track.info.author})`.substring(0, 100),
-          value: track.info.uri
+          value: track.info.uri || track.info.title
         };
       });
 
@@ -433,7 +738,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 // 🎛️ CORE MUSIC ENGINE EXECUTOR
 // ==========================================
 async function executePlay(guild, member, channel, query, sendReply) {
-  const voiceChannel = member.voice.channel;
+  const voiceChannel = member?.voice?.channel;
   if (!voiceChannel) {
     return sendReply({
       embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('🌸 **Please join a voice channel first!**')]
@@ -441,28 +746,75 @@ async function executePlay(guild, member, channel, query, sendReply) {
   }
 
   const permissions = voiceChannel.permissionsFor(client.user);
-  if (!permissions.has('Connect') || !permissions.has('Speak')) {
+  if (!permissions || !permissions.has('Connect') || !permissions.has('Speak')) {
     return sendReply({
       embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('⚠️ **I need connect and speak permissions in your voice channel!**')]
     });
   }
 
+  if (!(await getMusicNode())) return sendReply({ embeds: [NO_NODE_EMBED()] });
+
   let player = client.poru.players.get(guild.id);
+  // A player left over from a dead Lavalink session can never play again; rebuild it.
+  if (player && (!player.node?.isConnected || client.poru.nodes.get(player.node.name) !== player.node)) {
+    await player.destroy().catch(() => {});
+    player = null;
+  }
   if (!player) {
-    player = client.poru.createConnection({
-      guildId: guild.id,
-      voiceChannel: voiceChannel.id,
-      textChannel: channel.id,
-      deaf: true
-    });
+    try {
+      player = client.poru.createConnection({
+        guildId: guild.id,
+        voiceChannel: voiceChannel.id,
+        textChannel: channel.id,
+        deaf: true
+      });
+    } catch (err) {
+      console.log('[isai Audio Error] Could not create player:', err?.message || err);
+      return sendReply({
+        embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('⚠️ **I could not join your voice channel. Please try again in a moment!**')]
+      });
+    }
   }
 
   const isUrl = /^https?:\/\//i.test(query);
-  const res = await client.poru.resolve({
-    query: query,
-    source: isUrl ? undefined : 'ytmsearch',
-    requester: member.user
-  });
+  let res = null;
+
+  if (isUrl) {
+    try {
+      res = await client.poru.resolve({
+        query: query,
+        requester: member.user
+      });
+    } catch (err) {
+      console.log('[isai Audio Error] URL resolve failed:', err.message);
+    }
+  } else {
+    // Try multiple search sources in order: ytmsearch -> ytsearch -> scsearch
+    const searchPlatforms = ['ytmsearch', 'ytsearch', 'scsearch'];
+    for (const source of searchPlatforms) {
+      try {
+        const candidate = await client.poru.resolve({
+          query: query,
+          source: source,
+          requester: member.user
+        });
+        if (candidate && candidate.tracks && candidate.tracks.length > 0 && candidate.loadType !== 'error' && candidate.loadType !== 'LOAD_FAILED') {
+          res = candidate;
+          break;
+        }
+      } catch (err) {
+        console.log(`[isai Audio] ${source} search failed:`, err.message);
+      }
+    }
+  }
+
+  if (!res) {
+    const existing = client.poru.players.get(guild.id);
+    if (existing && !existing.currentTrack && existing.queue.length === 0) existing.destroy();
+    return sendReply({
+      embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('⚠️ **The music server is having trouble loading songs right now. Please try again shortly!**')]
+    });
+  }
 
   if (res.loadType === 'LOAD_FAILED' || res.loadType === 'error') {
     return sendReply({
@@ -543,26 +895,31 @@ async function executePlay(guild, member, channel, query, sendReply) {
     }
   }
 
-  if (!player.isPlaying && player.isConnected) {
-    player.play();
+  // Don't yank a paused track out from under the user when they queue a song.
+  if (!player.isPlaying) {
+    safe(player.play());
   }
 }
 
-function setBassBoost(player, enable) {
+async function setBassBoost(player, enable) {
   const state = getState(player.guildId);
   state.bassboost = enable;
 
   if (!player.filters) return;
-  if (enable) {
-    player.filters.setEqualizer([
-      { band: 0, gain: 0.25 },
-      { band: 1, gain: 0.20 },
-      { band: 2, gain: 0.15 },
-      { band: 3, gain: 0.10 },
-      { band: 4, gain: 0.05 }
-    ]);
-  } else {
-    player.filters.clearFilters();
+  try {
+    if (enable) {
+      await player.filters.setEqualizer([
+        { band: 0, gain: 0.25 },
+        { band: 1, gain: 0.20 },
+        { band: 2, gain: 0.15 },
+        { band: 3, gain: 0.10 },
+        { band: 4, gain: 0.05 }
+      ]);
+    } else {
+      await player.filters.clearFilters();
+    }
+  } catch (err) {
+    console.log('[isai Bass Error]', err?.message || err);
   }
 }
 
@@ -576,22 +933,30 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
   if (!interaction.isChatInputCommand()) return;
 
+  // Slash commands need a guild: in DMs `guild` and `member.voice` are null.
+  if (!interaction.guild || !interaction.member) {
+    return interaction.reply({
+      content: '🌸 I only work inside servers — invite me to a server to use my commands!',
+      flags: MessageFlags.Ephemeral
+    });
+  }
+
   const { commandName, guild, member, channel, user } = interaction;
   const isOwner = isOwnerUser(user.id);
 
-  if (['say', 'dm', 'status', 'customstatus', 'devhelp'].includes(commandName) && !isOwner) {
-    return interaction.reply({ content: 'Nothing here.', ephemeral: true });
+  if (['say', 'dm', 'status', 'customstatus', 'devhelp', 'prefix'].includes(commandName) && !isOwner) {
+    return interaction.reply({ content: 'Nothing here.', flags: MessageFlags.Ephemeral });
   }
 
   // Owner Commands
   if (commandName === 'devhelp') {
-    return interaction.reply({ embeds: [buildDevHelpEmbed()], ephemeral: true });
+    return interaction.reply({ embeds: [buildDevHelpEmbed()], flags: MessageFlags.Ephemeral });
   }
 
   if (commandName === 'say') {
     const text = interaction.options.getString('content');
     await channel.send(text);
-    return interaction.reply({ content: 'Message sent ♡', ephemeral: true });
+    return interaction.reply({ content: 'Message sent ♡', flags: MessageFlags.Ephemeral });
   }
 
   if (commandName === 'dm') {
@@ -599,16 +964,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const text = interaction.options.getString('content');
     try {
       await target.send(text);
-      return interaction.reply({ content: `Sent to ${target.tag} ✨`, ephemeral: true });
+      return interaction.reply({ content: `Sent to ${target.tag} ✨`, flags: MessageFlags.Ephemeral });
     } catch {
-      return interaction.reply({ content: `Could not DM ${target.tag}. DMs might be closed.`, ephemeral: true });
+      return interaction.reply({ content: `Could not DM ${target.tag}. DMs might be closed.`, flags: MessageFlags.Ephemeral });
     }
   }
 
   if (commandName === 'status') {
     const statusType = interaction.options.getString('type');
     client.user.setPresence({ status: statusType });
-    return interaction.reply({ content: `Status set to \`${statusType}\` ✨`, ephemeral: true });
+    return interaction.reply({ content: `Status set to \`${statusType}\` ✨`, flags: MessageFlags.Ephemeral });
   }
 
   if (commandName === 'customstatus') {
@@ -616,7 +981,46 @@ client.on(Events.InteractionCreate, async (interaction) => {
     client.user.setPresence({
       activities: [{ name: 'Custom Status', state: statusText, type: ActivityType.Custom }]
     });
-    return interaction.reply({ content: `Bubble status updated to: "${statusText}" 🫧`, ephemeral: true });
+    return interaction.reply({ content: `Bubble status updated to: "${statusText}" 🫧`, flags: MessageFlags.Ephemeral });
+  }
+
+  if (commandName === 'prefix') {
+    const value = (interaction.options.getString('new_prefix') || '').trim();
+    if (!value || value.length > 5 || /\s/.test(value)) {
+      return interaction.reply({ content: '⚠️ Prefix must be 1-5 characters with no spaces.', flags: MessageFlags.Ephemeral });
+    }
+    prefix = value;
+    settings.prefix = value;
+    saveSettings();
+    return interaction.reply({
+      embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription(`✨ **Prefix updated to** \`${value}\``)]
+    });
+  }
+
+  if (commandName === '24-7') {
+    // Same reason as /connect: the node wait can outlive the reply window.
+    await interaction.deferReply();
+    const voice = member.voice?.channel;
+    const enable = !settings.stay247[guild.id];
+    const result = await setStay247(guild, voice, channel, enable);
+    if (!result.ok) {
+      return interaction.editReply(
+        result.reason === 'voice'
+          ? { content: 'Join a voice channel first!' }
+          : { embeds: [NO_NODE_EMBED()] }
+      );
+    }
+    return interaction.editReply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(THEME_COLOR)
+          .setDescription(
+            result.enabled
+              ? `🔁 **24/7 mode enabled** — I'll stay in **${voice.name}** even after the queue ends.`
+              : '🔁 **24/7 mode disabled.**'
+          )
+      ]
+    });
   }
 
   // Music Commands
@@ -625,100 +1029,110 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (commandName === 'play') {
     await interaction.deferReply();
     const query = interaction.options.getString('query');
-    return executePlay(guild, member, channel, query, (opts) => interaction.editReply(opts));
+    return executePlay(guild, member, channel, query, (opts) => interaction.editReply(opts)).catch((err) => {
+      console.log('[isai Audio Error] Play failed:', err?.message || err);
+    });
   }
 
   if (commandName === 'connect') {
-    if (!member.voice.channel) {
-      return interaction.reply({ content: 'Join a voice channel first!', ephemeral: true });
+    const voice = member.voice?.channel;
+    if (!voice) {
+      return interaction.reply({ content: 'Join a voice channel first!', flags: MessageFlags.Ephemeral });
     }
+    // Defer first: waiting for a dropped node can take longer than the 3s reply window.
+    await interaction.deferReply();
+    if (!(await getMusicNode())) return interaction.editReply({ embeds: [NO_NODE_EMBED()] });
     client.poru.createConnection({
       guildId: guild.id,
-      voiceChannel: member.voice.channel.id,
+      voiceChannel: voice.id,
       textChannel: channel.id,
       deaf: true
     });
-    return interaction.reply({
-      embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription(`Joined **${member.voice.channel.name}** ♡`)]
+    return interaction.editReply({
+      embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription(`Joined **${voice.name}** ♡`)]
     });
   }
 
   if (commandName === 'disconnect') {
-    if (!player) return interaction.reply({ content: 'Not connected to any voice channel.', ephemeral: true });
+    if (!player) return interaction.reply({ content: 'Not connected to any voice channel.', flags: MessageFlags.Ephemeral });
+    if (settings.stay247[guild.id]) {
+      delete settings.stay247[guild.id];
+      saveSettings();
+    }
     await cleanupOldPanel(guild.id);
-    player.destroy();
+    safe(player.destroy());
     return interaction.reply({
       embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('Disconnected from the voice channel 🌸')]
     });
   }
 
   if (commandName === 'pause') {
-    if (!player) return interaction.reply({ content: 'Nothing is playing.', ephemeral: true });
-    player.pause(true);
+    if (!player) return interaction.reply({ content: 'Nothing is playing.', flags: MessageFlags.Ephemeral });
+    safe(player.pause(true));
     return interaction.reply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('⏸️ **Playback paused.**')] });
   }
 
   if (commandName === 'resume') {
-    if (!player) return interaction.reply({ content: 'Nothing is playing.', ephemeral: true });
-    player.pause(false);
+    if (!player) return interaction.reply({ content: 'Nothing is playing.', flags: MessageFlags.Ephemeral });
+    safe(player.pause(false));
     return interaction.reply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('▶️ **Playback resumed.**')] });
   }
 
   if (commandName === 'skip') {
-    if (!player) return interaction.reply({ content: 'Nothing is playing.', ephemeral: true });
-    player.skip();
+    if (!player) return interaction.reply({ content: 'Nothing is playing.', flags: MessageFlags.Ephemeral });
+    safe(player.skip());
     return interaction.reply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('⏭️ **Skipped track.**')] });
   }
 
   if (commandName === 'previous') {
-    if (!player) return interaction.reply({ content: 'Nothing is playing.', ephemeral: true });
+    if (!player) return interaction.reply({ content: 'Nothing is playing.', flags: MessageFlags.Ephemeral });
     const state = getState(guild.id);
-    if (!state.previousTrack) return interaction.reply({ content: 'No previous track recorded in this session.', ephemeral: true });
+    if (!state.previousTrack) return interaction.reply({ content: 'No previous track recorded in this session.', flags: MessageFlags.Ephemeral });
     player.queue.unshift(state.previousTrack);
-    player.skip();
+    safe(player.skip());
     return interaction.reply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription(`⏮️ Playing previous: **${state.previousTrack.info.title}**`)] });
   }
 
   if (commandName === 'stop') {
-    if (!player) return interaction.reply({ content: 'Nothing is playing.', ephemeral: true });
+    if (!player) return interaction.reply({ content: 'Nothing is playing.', flags: MessageFlags.Ephemeral });
     stopMusic(player, guild.id);
     return interaction.reply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('⏹️ **Music stopped and queue cleared.**')] });
   }
 
   if (commandName === 'shuffle') {
-    if (!player || player.queue.length === 0) return interaction.reply({ content: 'Not enough songs in queue to shuffle.', ephemeral: true });
+    if (!player || player.queue.length === 0) return interaction.reply({ content: 'Not enough songs in queue to shuffle.', flags: MessageFlags.Ephemeral });
     player.queue.shuffle();
     return interaction.reply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription(`🔀 **Shuffled ${player.queue.length} track(s)!**`)] });
   }
 
   if (commandName === 'clear') {
-    if (!player || player.queue.length === 0) return interaction.reply({ content: 'Queue is already empty.', ephemeral: true });
+    if (!player || player.queue.length === 0) return interaction.reply({ content: 'Queue is already empty.', flags: MessageFlags.Ephemeral });
     player.queue.clear();
     return interaction.reply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('🗑️ **Queue cleared completely.**')] });
   }
 
   if (commandName === 'remove') {
-    if (!player || player.queue.length === 0) return interaction.reply({ content: 'The queue is empty.', ephemeral: true });
+    if (!player || player.queue.length === 0) return interaction.reply({ content: 'The queue is empty.', flags: MessageFlags.Ephemeral });
     const target = interaction.options.getString('target');
     const index = parseInt(target, 10);
 
     if (!isNaN(index) && index > 0 && index <= player.queue.length) {
       const removed = player.queue.remove(index - 1);
-      return interaction.reply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription(`Removed: **${removed[0]?.info.title || target}**`)] });
+      return interaction.reply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription(`Removed: **${removed?.info.title || target}**`)] });
     } else {
       const songIndex = player.queue.findIndex(t => t.info.title.toLowerCase().includes(target.toLowerCase()));
       if (songIndex !== -1) {
         const removed = player.queue.remove(songIndex);
-        return interaction.reply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription(`Removed: **${removed[0]?.info.title}**`)] });
+        return interaction.reply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription(`Removed: **${removed?.info.title}**`)] });
       }
-      return interaction.reply({ content: 'Could not find that track in the queue.', ephemeral: true });
+      return interaction.reply({ content: 'Could not find that track in the queue.', flags: MessageFlags.Ephemeral });
     }
   }
 
   if (commandName === 'bass') {
-    if (!player) return interaction.reply({ content: 'Nothing is playing.', ephemeral: true });
+    if (!player) return interaction.reply({ content: 'Nothing is playing.', flags: MessageFlags.Ephemeral });
     const enable = interaction.options.getBoolean('enabled');
-    setBassBoost(player, enable);
+    await setBassBoost(player, enable);
     return interaction.reply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription(`🎧 **Bass boost set to:** \`${enable ? 'ON' : 'OFF'}\``)] });
   }
 
@@ -734,7 +1148,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
   if (commandName === 'queue') {
     if (!player || (!player.currentTrack && player.queue.length === 0)) {
-      return interaction.reply({ content: 'Queue is currently empty.', ephemeral: true });
+      return interaction.reply({ content: 'Queue is currently empty.', flags: MessageFlags.Ephemeral });
     }
     const list = player.queue.slice(0, 10).map((t, i) => `**${i + 1}.** [${t.info.title}](${t.info.uri}) • \`${formatTime(t.info.length)}\``).join('\n');
     const embed = new EmbedBuilder()
@@ -747,6 +1161,27 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (commandName === 'help') {
     return interaction.reply({ embeds: [buildHelpEmbed()] });
   }
+
+  if (commandName === 'ping') {
+    const sent = await interaction.deferReply({ fetchReply: true });
+    const roundtrip = sent.createdTimestamp - interaction.createdTimestamp;
+    const wsPing = client.ws.ping;
+    const node = client.poru.leastUsedNodes[0];
+    const nodeStatus = node ? `🟢 Connected (\`${node.name}\`)` : '🔴 Offline';
+
+    const embed = new EmbedBuilder()
+      .setColor(THEME_COLOR)
+      .setTitle('🏓 **Pong!**')
+      .setDescription(
+        `> ˚.⋆ **Gateway Ping:** \`${wsPing >= 0 ? wsPing : 0}ms\`\n` +
+        `> ˚.⋆ **Roundtrip Latency:** \`${roundtrip}ms\`\n` +
+        `> ˚.⋆ **Audio Engine:** ${nodeStatus}`
+      )
+      .setFooter({ text: 'isai Audio Latency ♡', iconURL: client.user.displayAvatarURL() })
+      .setTimestamp();
+
+    return interaction.editReply({ embeds: [embed] });
+  }
 });
 
 // ==========================================
@@ -754,30 +1189,36 @@ client.on(Events.InteractionCreate, async (interaction) => {
 // ==========================================
 async function handleButtonInteraction(interaction) {
   const { customId, guild, member } = interaction;
+  if (!guild) return;
   const player = client.poru.players.get(guild.id);
 
   if (customId.startsWith('loop_')) {
-    if (!player) return interaction.reply({ content: 'Player is no longer active.', ephemeral: true });
+    if (!player) return interaction.reply({ content: 'Player is no longer active.', flags: MessageFlags.Ephemeral });
     const mode = customId.split('_')[1];
     if (mode === 'off') player.setLoop('NONE');
     else if (mode === 'track') player.setLoop('TRACK');
     else if (mode === 'queue') player.setLoop('QUEUE');
-    return interaction.reply({ content: `Loop set to \`${mode.toUpperCase()}\` 🔁`, ephemeral: true });
+    return interaction.reply({ content: `Loop set to \`${mode.toUpperCase()}\` 🔁`, flags: MessageFlags.Ephemeral });
   }
 
-  if (!player) return interaction.reply({ content: 'No music is currently playing.', ephemeral: true });
-  if (!member.voice.channel || member.voice.channel.id !== player.voiceChannel) {
-    return interaction.reply({ content: 'Please join my voice channel to use the controls!', ephemeral: true });
+  if (!player) return interaction.reply({ content: 'No music is currently playing.', flags: MessageFlags.Ephemeral });
+  if (!member?.voice?.channel || member.voice.channel.id !== player.voiceChannel) {
+    return interaction.reply({ content: 'Please join my voice channel to use the controls!', flags: MessageFlags.Ephemeral });
   }
 
-  await interaction.deferUpdate();
+  // A second click on an expired panel would otherwise reject unhandled.
+  try {
+    await interaction.deferUpdate();
+  } catch {
+    return;
+  }
 
   switch (customId) {
     case 'btn_pause':
-      player.pause(!player.isPaused);
+      safe(player.pause(!player.isPaused));
       break;
     case 'btn_skip':
-      player.skip();
+      safe(player.skip());
       break;
     case 'btn_stop':
       stopMusic(player, guild.id);
@@ -786,7 +1227,7 @@ async function handleButtonInteraction(interaction) {
       const state = getState(guild.id);
       if (state.previousTrack) {
         player.queue.unshift(state.previousTrack);
-        player.skip();
+        safe(player.skip());
       }
       break;
     case 'btn_shuffle':
@@ -798,13 +1239,13 @@ async function handleButtonInteraction(interaction) {
       break;
     case 'btn_bass':
       const curState = getState(guild.id);
-      setBassBoost(player, !curState.bassboost);
+      await setBassBoost(player, !curState.bassboost);
       break;
     case 'btn_queue':
       const qList = player.queue.slice(0, 5).map((t, i) => `${i + 1}. ${t.info.title.substring(0, 30)}...`).join('\n');
       await interaction.followUp({
         embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription(`**Up Next:**\n${qList || 'No more songs in queue.'}`)],
-        ephemeral: true
+        flags: MessageFlags.Ephemeral
       });
       break;
   }
@@ -825,14 +1266,34 @@ async function handleButtonInteraction(interaction) {
 // ==========================================
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot || !message.guild) return;
-  if (!message.content.toLowerCase().startsWith(prefix.toLowerCase())) return;
-
-  let rawContent = message.content.slice(prefix.length).trim();
-  const args = rawContent.split(/ +/);
-  const cmd = args.shift()?.toLowerCase();
-  if (!cmd) return;
+  // `message.member` can be missing for uncached members; every command needs it.
+  if (!message.member) return;
 
   const isOwner = isOwnerUser(message.author.id);
+  let isPrefixed = message.content.toLowerCase().startsWith(prefix.toLowerCase());
+  let rawContent = (isPrefixed ? message.content.slice(prefix.length) : message.content).trim();
+  let args = rawContent.split(/ +/);
+  let cmd = args.shift()?.toLowerCase();
+
+  // If the prefix itself is a letter that starts a command (e.g. prefix "p" and
+  // owner types "play x" without it), retry the message as a no-prefix command.
+  if (isPrefixed && isOwner && (!cmd || !NO_PREFIX_ALIASES.has(cmd))) {
+    const altContent = message.content.trim();
+    const altArgs = altContent.split(/ +/);
+    const altCmd = altArgs.shift()?.toLowerCase();
+    if (altCmd && NO_PREFIX_ALIASES.has(altCmd)) {
+      isPrefixed = false;
+      rawContent = altContent;
+      args = altArgs;
+      cmd = altCmd;
+    }
+  }
+
+  if (!cmd) return;
+
+  // No-prefix usage is an owner-only privilege, and only for real commands.
+  if (!isPrefixed && (!isOwner || !NO_PREFIX_ALIASES.has(cmd))) return;
+
   const isMatch = (aliases) => aliases.includes(cmd);
 
   // --- DEVELOPER HELP COMMAND ---
@@ -851,7 +1312,7 @@ client.on(Events.MessageCreate, async (message) => {
     if (cmd === 'say') {
       const content = args.join(' ');
       if (!content) return;
-      return message.channel.send(content);
+      return message.channel.send(content).catch(() => null);
     }
 
     if (cmd === 'dm') {
@@ -892,8 +1353,46 @@ client.on(Events.MessageCreate, async (message) => {
   }
 
   // --- MUSIC PREFIX & SHORT ALIAS COMMANDS ---
-  const sendReply = (opts) => message.channel.send(opts);
+  // Never let a missing-permission send turn into an unhandled rejection.
+  const sendReply = (opts) => message.channel.send(opts).catch(() => null);
   let player = client.poru.players.get(message.guild.id);
+
+  // Prefix: iprefix <new> / isetprefix <new> (Owner only)
+  if (isMatch(['prefix', 'setprefix'])) {
+    if (!isOwner) return;
+    const value = args.join(' ').trim();
+    if (!value || value.length > 5 || /\s/.test(value)) {
+      return sendReply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('⚠️ Prefix must be 1-5 characters with no spaces.')] });
+    }
+    prefix = value;
+    settings.prefix = value;
+    saveSettings();
+    return sendReply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription(`✨ **Prefix updated to** \`${value}\``)] });
+  }
+
+  // 24/7: i247 / i24/7 / istay
+  if (isMatch(['247', '24/7', 'stay'])) {
+    const voice = message.member.voice?.channel;
+    const enable = !settings.stay247[message.guild.id];
+    const result = await setStay247(message.guild, voice, message.channel, enable);
+    if (!result.ok) {
+      if (result.reason === 'voice') {
+        return sendReply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('🌸 Please join a voice channel first!')] });
+      }
+      return sendReply({ embeds: [NO_NODE_EMBED()] });
+    }
+    return sendReply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(THEME_COLOR)
+          .setDescription(
+            result.enabled
+              ? `🔁 **24/7 mode enabled** — I'll stay in **${voice.name}** even after the queue ends.`
+              : '🔁 **24/7 mode disabled.**'
+          )
+      ]
+    });
+  }
 
   // Play: iplay / ip
   if (isMatch(['play', 'p'])) {
@@ -901,49 +1400,57 @@ client.on(Events.MessageCreate, async (message) => {
     if (!query) {
       return sendReply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription(`🌸 Usage: \`${prefix}play <song title / url>\``)] });
     }
-    return executePlay(message.guild, message.member, message.channel, query, sendReply);
+    return executePlay(message.guild, message.member, message.channel, query, sendReply).catch((err) => {
+      console.log('[isai Audio Error] Play failed:', err?.message || err);
+    });
   }
 
   // Connect: iconnect / ic / ijoin / ij
   if (isMatch(['connect', 'c', 'join', 'j'])) {
-    if (!message.member.voice.channel) {
+    const voice = message.member.voice?.channel;
+    if (!voice) {
       return sendReply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('🌸 Please join a voice channel first!')] });
     }
+    if (!(await getMusicNode())) return sendReply({ embeds: [NO_NODE_EMBED()] });
     client.poru.createConnection({
       guildId: message.guild.id,
-      voiceChannel: message.member.voice.channel.id,
+      voiceChannel: voice.id,
       textChannel: message.channel.id,
       deaf: true
     });
-    return sendReply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription(`Joined **${message.member.voice.channel.name}** ♡`)] });
+    return sendReply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription(`Joined **${voice.name}** ♡`)] });
   }
 
   // Disconnect: idisconnect / idc / ileave / il
   if (isMatch(['disconnect', 'dc', 'leave', 'l'])) {
     if (!player) return sendReply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('🌸 I am not in any voice channel!')] });
+    if (settings.stay247[message.guild.id]) {
+      delete settings.stay247[message.guild.id];
+      saveSettings();
+    }
     await cleanupOldPanel(message.guild.id);
-    player.destroy();
+    safe(player.destroy());
     return sendReply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('Disconnected from voice channel 🌸')] });
   }
 
   // Pause: ipause
   if (isMatch(['pause'])) {
     if (!player) return;
-    player.pause(true);
+    safe(player.pause(true));
     return message.react('⏸️');
   }
 
   // Resume: iresume / ir
   if (isMatch(['resume', 'r'])) {
     if (!player) return;
-    player.pause(false);
+    safe(player.pause(false));
     return message.react('▶️');
   }
 
   // Skip: iskip / is / next
   if (isMatch(['skip', 's', 'next'])) {
     if (!player) return;
-    player.skip();
+    safe(player.skip());
     return message.react('⏭️');
   }
 
@@ -953,7 +1460,7 @@ client.on(Events.MessageCreate, async (message) => {
     const state = getState(message.guild.id);
     if (!state.previousTrack) return sendReply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('No previous track found.')] });
     player.queue.unshift(state.previousTrack);
-    player.skip();
+    safe(player.skip());
     return message.react('⏮️');
   }
 
@@ -995,12 +1502,12 @@ client.on(Events.MessageCreate, async (message) => {
     const index = parseInt(target, 10);
     if (!isNaN(index) && index > 0 && index <= player.queue.length) {
       const removed = player.queue.remove(index - 1);
-      return sendReply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription(`Removed: **${removed[0]?.info.title}**`)] });
+      return sendReply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription(`Removed: **${removed?.info.title}**`)] });
     } else {
       const songIndex = player.queue.findIndex(t => t.info.title.toLowerCase().includes(target.toLowerCase()));
       if (songIndex !== -1) {
         const removed = player.queue.remove(songIndex);
-        return sendReply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription(`Removed: **${removed[0]?.info.title}**`)] });
+        return sendReply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription(`Removed: **${removed?.info.title}**`)] });
       }
     }
     return sendReply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription('Track not found in queue.')] });
@@ -1018,7 +1525,7 @@ client.on(Events.MessageCreate, async (message) => {
     if (!player) return;
     const arg = args[0]?.toLowerCase();
     const enable = arg === 'true' || arg === 'on' || arg === '1';
-    setBassBoost(player, enable);
+    await setBassBoost(player, enable);
     return sendReply({ embeds: [new EmbedBuilder().setColor(THEME_COLOR).setDescription(`🎧 **Bass Boost:** \`${enable ? 'ON' : 'OFF'}\``)] });
   }
 
@@ -1033,10 +1540,66 @@ client.on(Events.MessageCreate, async (message) => {
     return sendReply({ embeds: [embed], components: [row] });
   }
 
+  // Ping: iping / ping / latency / pong
+  if (isMatch(['ping', 'latency', 'pong'])) {
+    const start = Date.now();
+    const wsPing = client.ws.ping >= 0 ? client.ws.ping : 0;
+    const node = client.poru.leastUsedNodes[0];
+    const nodeStatus = node ? `🟢 Connected (\`${node.name}\`)` : '🔴 Offline';
+
+    const initial = await sendReply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(THEME_COLOR)
+          .setDescription('🏓 *Pinging...*')
+      ]
+    });
+
+    const roundtrip = Date.now() - start;
+
+    const embed = new EmbedBuilder()
+      .setColor(THEME_COLOR)
+      .setTitle('🏓 **Pong!**')
+      .setDescription(
+        `> ˚.⋆ **Gateway Ping:** \`${wsPing}ms\`\n` +
+        `> ˚.⋆ **Roundtrip Latency:** \`${roundtrip}ms\`\n` +
+        `> ˚.⋆ **Audio Engine:** ${nodeStatus}`
+      )
+      .setFooter({ text: 'isai Audio Latency ♡', iconURL: client.user.displayAvatarURL() })
+      .setTimestamp();
+
+    if (initial && typeof initial.edit === 'function') {
+      return initial.edit({ embeds: [embed] });
+    }
+    return sendReply({ embeds: [embed] });
+  }
+
   // Help: ihelp / ih (Public Help - Dev commands excluded)
   if (isMatch(['help', 'h'])) {
     return sendReply({ embeds: [buildHelpEmbed()] });
   }
+});
+
+// Keep 24/7 guilds in their voice channel even if the bot gets disconnected.
+client.on(Events.VoiceStateUpdate, (oldState, newState) => {
+  if (!client.user || newState.id !== client.user.id) return;
+
+  const saved = settings.stay247[newState.guild.id];
+  if (!saved) return;
+
+  if (newState.channelId === saved.voiceChannel) return;
+
+  // The bot was moved to another channel: remember where it is.
+  if (newState.channelId) {
+    saved.voiceChannel = newState.channelId;
+    saveSettings();
+    return;
+  }
+
+  // Kicked or disconnected: rejoin shortly after.
+  setTimeout(() => {
+    rejoinStay(newState.guild.id).catch((err) => console.log('[isai 24/7 Error]', err?.message || err));
+  }, 2000);
 });
 
 // ==========================================
@@ -1045,9 +1608,9 @@ client.on(Events.MessageCreate, async (message) => {
 function buildHelpEmbed() {
   return new EmbedBuilder()
     .setColor(THEME_COLOR)
-    .setAuthor({ name: 'Isai • Music Commands', iconURL: client.user.displayAvatarURL() })
+    .setAuthor({ name: 'isai • Music Commands', iconURL: client.user.displayAvatarURL() })
     .setDescription(
-      `Welcome to **Isai (இசை)** — aesthetic music companion. 𝜗𝜚\n` +
+      `Welcome to **isai** — aesthetic music companion. 𝜗𝜚\n` +
       `Current Prefix: \`${prefix}\` | All commands work with **Slash (/)** & **Short Aliases**!\n`
     )
     .addFields(
@@ -1075,7 +1638,15 @@ function buildHelpEmbed() {
         name: '🌸 Voice Connections',
         value:
           `\`${prefix}connect\` • \`${prefix}join\` • \`${prefix}c\` • \`${prefix}j\` ➔ Join VC\n` +
-          `\`${prefix}disconnect\` • \`${prefix}leave\` • \`${prefix}dc\` ➔ Leave VC`
+          `\`${prefix}disconnect\` • \`${prefix}leave\` • \`${prefix}dc\` ➔ Leave VC\n` +
+          `\`${prefix}247\` • \`/24-7\` ➔ Stay in VC 24/7 (survives restarts)`
+      },
+      {
+        name: '⚙️ Utilities & Settings',
+        value:
+          `\`${prefix}ping\` • \`/ping\` ➔ Check bot latency & music node status\n` +
+          `\`${prefix}prefix <new>\` • \`/prefix\` ➔ Change prefix (Owner Only)\n` +
+          `Owners can also use any command **without** a prefix, e.g. \`play believer\``
       }
     )
     .setFooter({ text: 'Handcrafted with warmth & aesthetic care ♡', iconURL: client.user.displayAvatarURL() });
@@ -1087,7 +1658,7 @@ function buildHelpEmbed() {
 function buildDevHelpEmbed() {
   return new EmbedBuilder()
     .setColor(0x2b2d31)
-    .setAuthor({ name: 'Isai • Developer & Owner Controls', iconURL: client.user.displayAvatarURL() })
+    .setAuthor({ name: 'isai • Developer & Owner Controls', iconURL: client.user.displayAvatarURL() })
     .setDescription('Exclusive controls strictly accessible by verified bot owners. Messages automatically delete upon execution.')
     .addFields(
       {
@@ -1101,10 +1672,24 @@ function buildDevHelpEmbed() {
         value:
           `\`${prefix}status <online/idle/dnd>\` | \`/status <type>\`\n↳ Sets Discord online availability.\n\n` +
           `\`${prefix}custom status <text>\` | \`/customstatus <text>\`\n↳ Updates the bot's custom bubble status message.`
+      },
+      {
+        name: '⚙️ Settings & Privileges',
+        value:
+          `\`${prefix}prefix <new>\` | \`/prefix <new_prefix>\`\n↳ Changes the prefix for everyone (Owner Only).\n\n` +
+          `\`No-prefix commands\`\n↳ Owner IDs can type any command without the prefix, e.g. \`play believer\`.`
       }
     )
     .setFooter({ text: 'Confidential Developer Hub 🔐', iconURL: client.user.displayAvatarURL() });
 }
 
 // Log in
-client.login(process.env.TOKEN);
+if (!process.env.TOKEN) {
+  console.error('[isai] TOKEN is missing from .env — add your Discord bot token.');
+  process.exit(1);
+}
+
+client.login(process.env.TOKEN).catch((err) => {
+  console.error('[isai Login Error]', err?.message || err);
+  process.exit(1);
+});
